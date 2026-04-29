@@ -1,0 +1,3 @@
+from .similarity_matrix import compute_similarity_matrix, save_similarity_matrix
+from .rotation import estimate_sequence_rotation
+from .distance import compute_sequence_distance 

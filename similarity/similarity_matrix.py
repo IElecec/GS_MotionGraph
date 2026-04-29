@@ -23,14 +23,20 @@ def compute_similarity_matrix(
     n_a = len(gaussians_a)
     n_b = len(gaussians_b)
 
+    if window_size <= 0:
+        raise ValueError("window_size must be positive")
+
     matrix = torch.full((n_a, n_b), float("inf"), dtype=torch.float32)
     angle_matrix = torch.zeros((n_a, n_b), dtype=torch.float32)
+
+    if window_size > n_a or window_size > n_b:
+        return matrix, angle_matrix
 
     valid_start_a = 0
     valid_end_a = n_a - window_size + 1
 
-    valid_start_b = window_size - 1
-    valid_end_b = n_b
+    valid_start_b = 0
+    valid_end_b = n_b - window_size + 1
 
     with torch.no_grad():
         for s in tqdm(
@@ -44,14 +50,14 @@ def compute_similarity_matrix(
 
                 theta = estimate_sequence_rotation(
                     gaussians_a[s : s + window_size], 
-                    gaussians_b[t - window_size + 1 : t + 1],
+                    gaussians_b[t : t + window_size],
                 )
 
                 angle_matrix[s, t] = theta
 
                 matrix[s, t] = compute_sequence_distance(
                     gaussians_a[s : s + window_size],
-                    gaussians_b[t - window_size + 1 : t + 1],
+                    gaussians_b[t : t + window_size],
                     theta=theta,
                 )
 
@@ -60,6 +66,8 @@ def compute_similarity_matrix(
 def save_similarity_matrix(
     similarity_matrices: Tuple[torch.Tensor, torch.Tensor],
     output_dir: Path,
+    window_size: int,
+    min_gap: int,
 ) -> None:
     distance_matrix, angle_matrix = similarity_matrices
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -67,6 +75,10 @@ def save_similarity_matrix(
         {
             "distance_matrix": distance_matrix,
             "angle_matrix": angle_matrix,
+            "window_size": window_size,
+            "min_gap": min_gap,
+            "source_index_mode": "window_start",
+            "target_index_mode": "window_start",
         },
         output_dir / "similarity.pt",
     )

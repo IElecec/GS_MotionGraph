@@ -1,5 +1,4 @@
 import argparse
-from email import parser
 from pathlib import Path
 
 from utils import (
@@ -63,6 +62,8 @@ def main() -> None:
                     save_similarity_matrix(
                         similarity_matrix,
                         output_dir=Path(args.output)/ "similarity_matrices" / action_a / anim_a / action_b / anim_b,
+                        window_size=args.window,
+                        min_gap=args.min_gap,
                     )
 
 

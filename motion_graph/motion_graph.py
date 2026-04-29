@@ -1,3 +1,287 @@
+import json
+import math
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Set, Tuple
+
+from utils import Database
+
+from .transition import FrameRef, GraphEdge, Transition, build_transitions_from_matrices
+
+FrameKey = Tuple[str, str, int]
+
+
+def _resolve_similarity_dir(path: Path) -> Path:
+    if not path.exists():
+        raise FileNotFoundError(f"Similarity directory not found: {path}")
+
+    nested_dir = path / "similarity_matrices"
+    if nested_dir.is_dir():
+        return nested_dir
+    if not path.is_dir():
+        raise NotADirectoryError(f"Similarity directory is not a directory: {path}")
+    return path
+
+
+def _load_similarity_payload(path: Path) -> Dict[str, Any]:
+    import torch
+
+    return torch.load(path, map_location="cpu")
+
+
+def _scalar(value: Any) -> float:
+    if hasattr(value, "item"):
+        return float(value.item())
+    return float(value)
+
+
+def _infer_window_size(distance_matrix: Any) -> int:
+    last_valid_row = -1
+    first_valid_col = None
+
+    for row in range(distance_matrix.shape[0]):
+        row_has_valid = False
+        for col in range(distance_matrix.shape[1]):
+            value = _scalar(distance_matrix[row, col])
+            if not math.isfinite(value):
+                continue
+
+            row_has_valid = True
+            if first_valid_col is None or col < first_valid_col:
+                first_valid_col = col
+
+        if row_has_valid:
+            last_valid_row = row
+
+    if last_valid_row < 0:
+        return 1
+
+    inferred_from_rows = distance_matrix.shape[0] - last_valid_row
+    inferred_from_cols = 1 if first_valid_col is None else first_valid_col + 1
+    return max(1, inferred_from_rows, inferred_from_cols)
+
+
+def _infer_target_index_mode(distance_matrix: Any, window_size: int) -> str:
+    first_valid_col = None
+    for col in range(distance_matrix.shape[1]):
+        has_valid = False
+        for row in range(distance_matrix.shape[0]):
+            if math.isfinite(_scalar(distance_matrix[row, col])):
+                has_valid = True
+                break
+        if has_valid:
+            first_valid_col = col
+            break
+
+    if first_valid_col == window_size - 1:
+        return "window_end"
+    return "window_start"
+
+
+def _frame_counts(database: Database) -> Dict[Tuple[str, str], int]:
+    counts: Dict[Tuple[str, str], int] = {}
+    for action in database.get_actions():
+        for animation in database.get_animations(action):
+            counts[(action, animation)] = len(database.get_frames(action, animation))
+    return counts
+
+
+def _build_sequence_nodes(database: Database) -> List[FrameRef]:
+    nodes: List[FrameRef] = []
+    for action in database.get_actions():
+        for animation in database.get_animations(action):
+            frames = database.get_frames(action, animation)
+            for frame_idx in range(len(frames)):
+                nodes.append(FrameRef(action=action, animation=animation, frame=frame_idx))
+    return nodes
+
+
+def _build_sequence_edges(database: Database) -> List[GraphEdge]:
+    edges: List[GraphEdge] = []
+    for action in database.get_actions():
+        for animation in database.get_animations(action):
+            frames = database.get_frames(action, animation)
+            for frame_idx in range(len(frames) - 1):
+                edges.append(
+                    GraphEdge(
+                        source=FrameRef(action=action, animation=animation, frame=frame_idx),
+                        target=FrameRef(
+                            action=action,
+                            animation=animation,
+                            frame=frame_idx + 1,
+                        ),
+                        kind="sequence",
+                    )
+                )
+    return edges
+
+
+def _dfs(node: FrameKey, graph: Dict[FrameKey, List[FrameKey]], visited: Set[FrameKey], order: List[FrameKey]) -> None:
+    visited.add(node)
+    for neighbor in graph.get(node, []):
+        if neighbor not in visited:
+            _dfs(neighbor, graph, visited, order)
+    order.append(node)
+
+
+def _collect_component(node: FrameKey, graph: Dict[FrameKey, List[FrameKey]], visited: Set[FrameKey], component: List[FrameKey]) -> None:
+    visited.add(node)
+    component.append(node)
+    for neighbor in graph.get(node, []):
+        if neighbor not in visited:
+            _collect_component(neighbor, graph, visited, component)
+
+
+@dataclass
 class MotionGraph:
-    def __init__(self, similarity_matrices: Dict[Tuple[str, str], np.ndarray]):
-        self.similarity_matrices = similarity_matrices
+    database: Database
+    nodes: List[FrameRef] = field(default_factory=list)
+    edges: List[GraphEdge] = field(default_factory=list)
+    transitions: List[Transition] = field(default_factory=list)
+
+    @classmethod
+    def build(
+        cls,
+        database: Database,
+        similarity_dir: Path,
+        distance_threshold: float,
+        top_k: int,
+        prune_dead_ends: bool = True,
+    ) -> "MotionGraph":
+        similarity_root = _resolve_similarity_dir(similarity_dir)
+        nodes = _build_sequence_nodes(database)
+        edges = _build_sequence_edges(database)
+        transitions: List[Transition] = []
+        frame_counts = _frame_counts(database)
+        found_similarity_file = False
+
+        for similarity_file in sorted(similarity_root.rglob("similarity.pt")):
+            found_similarity_file = True
+            relative_parts = similarity_file.relative_to(similarity_root).parts
+            if len(relative_parts) != 5:
+                continue
+
+            src_action, src_anim, dst_action, dst_anim, _ = relative_parts
+            payload = _load_similarity_payload(similarity_file)
+            distance_matrix = payload["distance_matrix"]
+            angle_matrix = payload["angle_matrix"]
+            window_size = int(payload.get("window_size", _infer_window_size(distance_matrix)))
+            source_index_mode = payload.get("source_index_mode", "window_start")
+            target_index_mode = payload.get(
+                "target_index_mode",
+                _infer_target_index_mode(distance_matrix, window_size),
+            )
+            source_frame_limit = frame_counts.get((src_action, src_anim), distance_matrix.shape[0])
+            target_frame_limit = frame_counts.get((dst_action, dst_anim), angle_matrix.shape[1])
+
+            pair_transitions = build_transitions_from_matrices(
+                source_action=src_action,
+                source_animation=src_anim,
+                target_action=dst_action,
+                target_animation=dst_anim,
+                distance_matrix=distance_matrix,
+                angle_matrix=angle_matrix,
+                distance_threshold=distance_threshold,
+                top_k=top_k,
+                window_size=window_size,
+                source_index_mode=source_index_mode,
+                target_index_mode=target_index_mode,
+                source_frame_limit=source_frame_limit,
+                target_frame_limit=target_frame_limit,
+            )
+            transitions.extend(pair_transitions)
+
+            for transition in pair_transitions:
+                edges.append(
+                    GraphEdge(
+                        source=transition.source,
+                        target=transition.target,
+                        kind="transition",
+                        distance=transition.distance,
+                        theta=transition.theta,
+                    )
+                )
+
+        if not found_similarity_file:
+            raise FileNotFoundError(
+                f"No similarity.pt files found under {similarity_root}"
+            )
+
+        graph = cls(
+            database=database,
+            nodes=nodes,
+            edges=edges,
+            transitions=transitions,
+        )
+        if prune_dead_ends:
+            return graph.largest_strongly_connected_component()
+        return graph
+
+    def largest_strongly_connected_component(self) -> "MotionGraph":
+        adjacency: Dict[FrameKey, List[FrameKey]] = {
+            node.key(): [] for node in self.nodes
+        }
+        reverse_adjacency: Dict[FrameKey, List[FrameKey]] = {
+            node.key(): [] for node in self.nodes
+        }
+
+        for edge in self.edges:
+            source_key = edge.source.key()
+            target_key = edge.target.key()
+            adjacency.setdefault(source_key, []).append(target_key)
+            reverse_adjacency.setdefault(target_key, []).append(source_key)
+
+        visited: Set[FrameKey] = set()
+        order: List[FrameKey] = []
+        for node_key in adjacency:
+            if node_key not in visited:
+                _dfs(node_key, adjacency, visited, order)
+
+        visited.clear()
+        largest_component: List[FrameKey] = []
+        for node_key in reversed(order):
+            if node_key in visited:
+                continue
+            component: List[FrameKey] = []
+            _collect_component(node_key, reverse_adjacency, visited, component)
+            if len(component) > len(largest_component):
+                largest_component = component
+
+        keep = set(largest_component)
+        nodes = [node for node in self.nodes if node.key() in keep]
+        edges = [
+            edge
+            for edge in self.edges
+            if edge.source.key() in keep and edge.target.key() in keep
+        ]
+        transitions = [
+            transition
+            for transition in self.transitions
+            if transition.source.key() in keep and transition.target.key() in keep
+        ]
+        return MotionGraph(
+            database=self.database,
+            nodes=nodes,
+            edges=edges,
+            transitions=transitions,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "database_dir": str(self.database.base_dir),
+            "num_nodes": len(self.nodes),
+            "num_edges": len(self.edges),
+            "num_transitions": len(self.transitions),
+            "nodes": [node.to_dict() for node in self.nodes],
+            "edges": [edge.to_dict() for edge in self.edges],
+            "transitions": [transition.to_dict() for transition in self.transitions],
+        }
+
+    def save(self, output_path: Path) -> Path:
+        if output_path.suffix == "":
+            output_path = output_path / "motion_graph.json"
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as handle:
+            json.dump(self.to_dict(), handle, indent=2)
+        return output_path

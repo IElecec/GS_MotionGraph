@@ -2,8 +2,9 @@ import argparse
 import html
 import json
 import math
+import os
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 NodeKey = Tuple[str, str, int]
 LaneKey = Tuple[str, str]
@@ -80,6 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=30.0,
         help="logical playback fps used by the random walker; edge traversal time is edge.length / fps",
+    )
+    parser.add_argument(
+        "--image-manifest",
+        default=None,
+        help="optional manifest.json produced by render_image_library.py; enables image playback in the HTML view",
     )
     return parser
 
@@ -270,15 +276,29 @@ def build_sequence_edges_from_nodes(nodes: List[Dict[str, Any]]) -> List[Dict[st
     return edges
 
 
+def transition_folder_name(transition_index: int, transition: Dict[str, Any]) -> str:
+    source = transition["source"]
+    target = transition["target"]
+    return (
+        f"{transition_index:04d}_"
+        f"{source['action']}_{source['animation']}_{int(source['frame']):04d}"
+        f"__"
+        f"{target['action']}_{target['animation']}_{int(target['frame']):04d}"
+    )
+
+
 def transition_to_edge_item(
     payload: Dict[str, Any],
     transition: Dict[str, Any],
+    transition_index: int,
 ) -> Dict[str, Any]:
     return {
         "source": transition["source"],
         "target": transition["target"],
         "kind": "transition",
         "length": transition_edge_length(payload),
+        "transition_index": int(transition_index),
+        "transition_folder": transition_folder_name(transition_index, transition),
         "distance": float(transition.get("distance", 0.0)),
         "theta": float(transition.get("theta", 0.0)),
     }
@@ -289,12 +309,12 @@ def get_action_internal_transitions(
     action: str,
 ) -> List[Dict[str, Any]]:
     transitions: List[Dict[str, Any]] = []
-    for transition in payload.get("transitions", []):
+    for transition_index, transition in enumerate(payload.get("transitions", [])):
         if transition["source"]["action"] != action:
             continue
         if transition["target"]["action"] != action:
             continue
-        transitions.append(transition_to_edge_item(payload, transition))
+        transitions.append(transition_to_edge_item(payload, transition, transition_index))
     transitions.sort(key=transition_sort_key)
     return transitions
 
@@ -304,8 +324,8 @@ def get_cross_action_transitions(
     max_transition_edges: int,
 ) -> List[Dict[str, Any]]:
     transitions = [
-        transition_to_edge_item(payload, transition)
-        for transition in payload.get("transitions", [])
+        transition_to_edge_item(payload, transition, transition_index)
+        for transition_index, transition in enumerate(payload.get("transitions", []))
         if transition["source"]["action"] != transition["target"]["action"]
     ]
     transitions.sort(key=transition_sort_key)
@@ -587,6 +607,9 @@ def build_line_edge_descriptor(
         "path_d": f"M {x1:.1f} {y1:.1f} L {x2:.1f} {y2:.1f}",
         "tooltip": tooltip,
         "length": int(item.get("length", 0)),
+        "kind": item.get("kind", "sequence"),
+        "source": item.get("source"),
+        "target": item.get("target"),
     }
 
 
@@ -625,6 +648,11 @@ def build_internal_transition_descriptor(
         "path_d": f"M {x1:.1f} {y1:.1f} Q {cx:.1f} {cy:.1f} {x2:.1f} {y2:.1f}",
         "tooltip": tooltip,
         "length": int(item.get("length", 0)),
+        "kind": item.get("kind", "transition"),
+        "source": item.get("source"),
+        "target": item.get("target"),
+        "transition_index": item.get("transition_index"),
+        "transition_folder": item.get("transition_folder"),
     }
 
 
@@ -667,6 +695,11 @@ def build_cross_transition_descriptor(
         "path_d": f"M {x1:.1f} {y1:.1f} Q {cx:.1f} {cy:.1f} {x2:.1f} {y2:.1f}",
         "tooltip": tooltip,
         "length": int(item.get("length", 0)),
+        "kind": item.get("kind", "transition"),
+        "source": item.get("source"),
+        "target": item.get("target"),
+        "transition_index": item.get("transition_index"),
+        "transition_folder": item.get("transition_folder"),
     }
 
 
@@ -731,32 +764,169 @@ def render_visible_edges(edge_descriptors: List[Dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def normal_frame_key(action: str, animation: str, frame: int) -> str:
+    return f"{action}|{animation}|{int(frame)}"
+
+
+def load_image_manifest(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def make_html_relative_path(target_path: Path, html_output_path: Path) -> str:
+    relative = os.path.relpath(target_path, html_output_path.parent)
+    return Path(relative).as_posix()
+
+
+def resolve_image_manifest_assets(
+    output_path: Path,
+    image_manifest_path: Optional[Path],
+) -> Optional[Dict[str, Any]]:
+    if image_manifest_path is None:
+        default_manifest = output_path.parent / "rendered_images" / "manifest.json"
+        if default_manifest.exists():
+            image_manifest_path = default_manifest
+        else:
+            return None
+
+    if not image_manifest_path.exists():
+        raise FileNotFoundError(f"Image manifest not found: {image_manifest_path}")
+
+    raw_manifest = load_image_manifest(image_manifest_path)
+    normal_frames = {
+        key: make_html_relative_path((image_manifest_path.parent / rel_path).resolve(), output_path)
+        for key, rel_path in raw_manifest.get("normal_frames", {}).items()
+    }
+    transition_frames = {
+        folder: [
+            make_html_relative_path((image_manifest_path.parent / rel_path).resolve(), output_path)
+            for rel_path in rel_paths
+        ]
+        for folder, rel_paths in raw_manifest.get("transition_frames", {}).items()
+    }
+    return {
+        "manifest_path": str(image_manifest_path),
+        "normal_frames": normal_frames,
+        "transition_frames": transition_frames,
+    }
+
+
+def build_sequence_image_paths(
+    edge: Dict[str, Any],
+    image_assets: Optional[Dict[str, Any]],
+) -> List[str]:
+    if image_assets is None:
+        return []
+
+    source = edge.get("source") or {}
+    target = edge.get("target") or {}
+    if not source or not target:
+        return []
+    if source.get("action") != target.get("action") or source.get("animation") != target.get("animation"):
+        return []
+
+    source_frame = int(source.get("frame", 0))
+    target_frame = int(target.get("frame", 0))
+    step = 1 if target_frame >= source_frame else -1
+    normal_frames = image_assets["normal_frames"]
+
+    image_paths: List[str] = []
+    for frame in range(source_frame + step, target_frame + step, step):
+        path = normal_frames.get(normal_frame_key(source["action"], source["animation"], frame))
+        if path:
+            image_paths.append(path)
+    return image_paths
+
+
+def build_transition_image_paths(
+    edge: Dict[str, Any],
+    image_assets: Optional[Dict[str, Any]],
+) -> List[str]:
+    if image_assets is None:
+        return []
+
+    transition_folder = edge.get("transition_folder")
+    if not transition_folder:
+        return []
+
+    image_paths = list(image_assets["transition_frames"].get(str(transition_folder), []))
+    target = edge.get("target") or {}
+    if target:
+        target_path = image_assets["normal_frames"].get(
+            normal_frame_key(
+                target["action"],
+                target["animation"],
+                int(target["frame"]),
+            )
+        )
+        if target_path:
+            image_paths.append(target_path)
+    return image_paths
+
+
+def build_edge_payload(
+    edge_descriptors: List[Dict[str, Any]],
+    image_assets: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    for edge in edge_descriptors:
+        kind = edge.get("kind", "sequence")
+        image_paths = (
+            build_transition_image_paths(edge, image_assets)
+            if kind == "transition"
+            else build_sequence_image_paths(edge, image_assets)
+        )
+        payload[edge["id"]] = {
+            "source": edge["source_id"],
+            "target": edge["target_id"],
+            "length": int(edge.get("length", 0)),
+            "kind": kind,
+            "transition_index": edge.get("transition_index"),
+            "transition_folder": edge.get("transition_folder"),
+            "image_paths": image_paths,
+            "label": f"{edge['source_id']} -> {edge['target_id']}",
+        }
+    return payload
+
+
 def build_walker_payload(
     nodes: List[Dict[str, Any]],
     positions: Dict[NodeKey, Tuple[float, float]],
     edge_descriptors: List[Dict[str, Any]],
     fps: float,
+    image_assets: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     node_positions = {
         node_id(node): [round(positions[node_key(node)][0], 3), round(positions[node_key(node)][1], 3)]
         for node in nodes
         if node_key(node) in positions
     }
+    node_info = {}
+    for node in nodes:
+        if node_key(node) not in positions:
+            continue
+        image_path = None
+        if image_assets is not None:
+            image_path = image_assets["normal_frames"].get(
+                normal_frame_key(node["action"], node["animation"], int(node["frame"]))
+            )
+        node_info[node_id(node)] = {
+            "action": node["action"],
+            "animation": node["animation"],
+            "frame": int(node["frame"]),
+            "image_path": image_path,
+        }
+
     outgoing: Dict[str, List[str]] = {}
     for edge in edge_descriptors:
         outgoing.setdefault(edge["source_id"], []).append(edge["id"])
     return {
         "fps": float(fps),
+        "has_images": image_assets is not None,
         "nodes": node_positions,
+        "node_info": node_info,
         "outgoing": outgoing,
-        "edges": {
-            edge["id"]: {
-                "source": edge["source_id"],
-                "target": edge["target_id"],
-                "length": int(edge.get("length", 0)),
-            }
-            for edge in edge_descriptors
-        },
+        "edges": build_edge_payload(edge_descriptors, image_assets),
     }
 
 
@@ -766,6 +936,7 @@ def render_svg(
     lane_spacing: int,
     max_transition_edges: int,
     fps: float,
+    image_assets: Optional[Dict[str, Any]],
 ) -> Tuple[str, str, str]:
     clusters, positions, width, height, cross_action_transitions = build_action_clusters(
         payload,
@@ -785,7 +956,13 @@ def render_svg(
     edge_svg = render_visible_edges(edge_descriptors)
     node_labels = render_node_frame_labels(all_nodes, positions)
     node_svg = render_nodes(all_nodes, positions)
-    walker_data = build_walker_payload(all_nodes, positions, edge_descriptors, fps=fps)
+    walker_data = build_walker_payload(
+        all_nodes,
+        positions,
+        edge_descriptors,
+        fps=fps,
+        image_assets=image_assets,
+    )
     visible_transition_count = sum(
         len(cluster["bridge_transitions"]) for cluster in clusters
     ) + len(cross_action_transitions)
@@ -818,6 +995,7 @@ def render_html(
     lane_spacing: int,
     max_transition_edges: int,
     fps: float,
+    image_assets: Optional[Dict[str, Any]],
 ) -> str:
     svg, summary, walker_data = render_svg(
         payload,
@@ -825,6 +1003,7 @@ def render_html(
         lane_spacing=lane_spacing,
         max_transition_edges=max_transition_edges,
         fps=fps,
+        image_assets=image_assets,
     )
 
     return f"""<!DOCTYPE html>
@@ -922,6 +1101,53 @@ def render_html(
       background: currentColor;
       display: inline-block;
     }}
+    .content-grid {{
+      display: grid;
+      grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }}
+    .preview-panel {{
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: #fffdfa;
+      box-shadow: 0 10px 26px rgba(65, 45, 22, 0.08);
+      padding: 10px;
+    }}
+    .preview-title {{
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 8px;
+    }}
+    .preview-frame {{
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      object-fit: contain;
+      border-radius: 12px;
+      background: linear-gradient(180deg, #f3eadf 0%, #fffdfa 100%);
+      border: 1px solid var(--border);
+      display: block;
+    }}
+    .preview-empty {{
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      border-radius: 12px;
+      border: 1px dashed var(--border);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+      padding: 18px;
+      color: var(--muted);
+      background: linear-gradient(180deg, #f3eadf 0%, #fffdfa 100%);
+      box-sizing: border-box;
+    }}
+    .preview-caption {{
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      min-height: 18px;
+    }}
     .canvas {{
       border: 1px solid var(--border);
       border-radius: 16px;
@@ -990,6 +1216,11 @@ def render_html(
       stroke-width: 1.6;
       filter: drop-shadow(0 0 5px rgba(242, 177, 52, 0.6));
     }}
+    @media (max-width: 1080px) {{
+      .content-grid {{
+        grid-template-columns: 1fr;
+      }}
+    }}
   </style>
 </head>
 <body>
@@ -1012,8 +1243,16 @@ def render_html(
       </label>
       <span id="walker-fps-readout" class="readout"></span>
     </div>
-    <div class="canvas">
-      {svg}
+    <div class="content-grid">
+      <div class="preview-panel">
+        <div class="preview-title">Walker Preview</div>
+        <img id="walker-preview-image" class="preview-frame" alt="Walker frame preview" hidden>
+        <div id="walker-preview-empty" class="preview-empty">Render an image library and pass `--image-manifest` to show frame playback here.</div>
+        <div id="walker-preview-caption" class="preview-caption"></div>
+      </div>
+      <div class="canvas">
+        {svg}
+      </div>
     </div>
   </div>
   <script>
@@ -1024,6 +1263,9 @@ def render_html(
     const fpsSlider = document.getElementById("walker-fps-slider");
     const fpsInput = document.getElementById("walker-fps-input");
     const fpsReadout = document.getElementById("walker-fps-readout");
+    const previewImage = document.getElementById("walker-preview-image");
+    const previewEmpty = document.getElementById("walker-preview-empty");
+    const previewCaption = document.getElementById("walker-preview-caption");
 
     if (walkerBall && edgeIds.length > 0 && nodesWithOutgoing.length > 0) {{
       let walkerFps = Math.max(Number(walkerData.fps) || 30, 1);
@@ -1032,6 +1274,7 @@ def render_html(
       let edgeLength = 0;
       let edgeDuration = 1000 / walkerFps;
       let edgeStartTime = null;
+      let lastPreviewPath = null;
 
       function frameDurationMs() {{
         return 1000 / walkerFps;
@@ -1073,6 +1316,52 @@ def render_html(
         syncFpsControls();
       }}
 
+      function imagePathAtCurrentPosition(progress) {{
+        const edge = walkerData.edges[currentEdgeId];
+        if (!edge) {{
+          return null;
+        }}
+
+        const imagePaths = edge.image_paths || [];
+        if (imagePaths.length > 0) {{
+          const idx = Math.min(
+            imagePaths.length - 1,
+            Math.max(0, Math.floor(progress * imagePaths.length))
+          );
+          return imagePaths[idx];
+        }}
+
+        const source = (walkerData.node_info || {{}})[edge.source];
+        const target = (walkerData.node_info || {{}})[edge.target];
+        if (!source || !target) {{
+          return null;
+        }}
+        return progress < 0.5 ? source.image_path : target.image_path;
+      }}
+
+      function updatePreview(progress) {{
+        const edge = walkerData.edges[currentEdgeId];
+        const imagePath = imagePathAtCurrentPosition(progress);
+        if (!previewImage || !previewEmpty || !previewCaption) {{
+          return;
+        }}
+
+        if (!imagePath) {{
+          previewImage.hidden = true;
+          previewEmpty.hidden = false;
+          previewCaption.textContent = edge ? edge.label || "" : "";
+          return;
+        }}
+
+        if (imagePath !== lastPreviewPath) {{
+          previewImage.src = imagePath;
+          lastPreviewPath = imagePath;
+        }}
+        previewImage.hidden = false;
+        previewEmpty.hidden = true;
+        previewCaption.textContent = edge ? edge.label || imagePath : imagePath;
+      }}
+
       function pickRandom(list) {{
         return list[Math.floor(Math.random() * list.length)];
       }}
@@ -1110,6 +1399,7 @@ def render_html(
         const point = currentPath.getPointAtLength(progress * edgeLength);
         walkerBall.setAttribute("cx", point.x.toFixed(2));
         walkerBall.setAttribute("cy", point.y.toFixed(2));
+        updatePreview(progress);
 
         if (progress >= 1) {{
           const edge = walkerData.edges[currentEdgeId];
@@ -1129,7 +1419,6 @@ def render_html(
           setWalkerFps(event.target.value);
         }});
       }}
-
       syncFpsControls();
       requestAnimationFrame(step);
     }}
@@ -1146,14 +1435,20 @@ def save_motion_graph_visualization(
     lane_spacing: int = 72,
     max_transition_edges: int = 0,
     fps: float = 30.0,
+    image_manifest_path: Optional[Path] = None,
 ) -> Path:
     payload = normalize_motion_graph_payload(dict(payload))
+    image_assets = resolve_image_manifest_assets(
+        output_path=output_path,
+        image_manifest_path=image_manifest_path,
+    )
     html_text = render_html(
         payload=payload,
         frame_spacing=frame_spacing,
         lane_spacing=lane_spacing,
         max_transition_edges=max_transition_edges,
         fps=fps,
+        image_assets=image_assets,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_text, encoding="utf-8")
@@ -1172,6 +1467,7 @@ def main() -> None:
         lane_spacing=args.lane_spacing,
         max_transition_edges=args.max_transition_edges,
         fps=args.fps,
+        image_manifest_path=None if args.image_manifest is None else Path(args.image_manifest),
     )
     print(f"Saved motion graph visualization to {output_path}")
 

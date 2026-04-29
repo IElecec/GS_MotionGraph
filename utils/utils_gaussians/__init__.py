@@ -1,1 +1,2 @@
 from .gaussian_model import GaussianModel
+from .graphics_utils import getProjectionMatrix

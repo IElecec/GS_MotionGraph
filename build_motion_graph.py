@@ -61,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=30.0,
         help="logical playback fps used by the random walker in the optional HTML visualization",
     )
+    parser.add_argument(
+        "--image-manifest",
+        default=None,
+        help="optional manifest.json produced by render_image_library.py; enables image playback in the HTML visualization",
+    )
     return parser
 
 
@@ -84,6 +89,7 @@ def main() -> None:
             output_path=Path(args.visualization),
             max_transition_edges=args.max_visualized_transitions,
             fps=args.visualization_fps,
+            image_manifest_path=None if args.image_manifest is None else Path(args.image_manifest),
         )
     print(
         f"Saved motion graph with {len(motion_graph.nodes)} nodes and "

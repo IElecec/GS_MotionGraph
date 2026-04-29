@@ -320,7 +320,7 @@ def save_transition_window(window: Dict[str, Any], output_dir: Path) -> List[Pat
 
     saved_paths: List[Path] = []
     for local_idx, frame in enumerate(window["frames"]):
-        frame_path = output_dir / f"frame_{local_idx}.ply"
+        frame_path = output_dir / f"point_cloud_{local_idx}.ply"
         frame.gaussian.save_ply(str(frame_path))
         saved_paths.append(frame_path)
 

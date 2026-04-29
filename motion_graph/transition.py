@@ -43,6 +43,7 @@ class GraphEdge:
     source: FrameRef
     target: FrameRef
     kind: str
+    length: int = 0
     distance: float = 0.0
     theta: float = 0.0
 
@@ -89,11 +90,19 @@ def _is_local_minimum(matrix: Any, row: int, col: int) -> bool:
     return True
 
 
-def _matrix_index_to_frame(index: int, mode: str, window_size: int) -> int:
+def _matrix_index_to_source_frame(index: int, mode: str, window_size: int) -> int:
     if mode == "window_start":
         return index
     if mode == "window_end":
         return index - window_size + 1
+    raise ValueError(f"Unsupported matrix index mode: {mode}")
+
+
+def _matrix_index_to_target_frame(index: int, mode: str, window_size: int) -> int:
+    if mode == "window_start":
+        return index + window_size - 1
+    if mode == "window_end":
+        return index
     raise ValueError(f"Unsupported matrix index mode: {mode}")
 
 
@@ -203,17 +212,17 @@ def build_transition_window(
 
     transition_frames: List[TransitionFrame] = []
     sequence_length = num_transition_frames + 2
-    target_start = target_frame
+    target_start = target_frame - sequence_length + 1
 
     if start_frame < 0 or start_frame + sequence_length > len(source_gaussians):
         raise ValueError("Source transition sequence exceeds frame range.")
-    if target_start < 0 or target_start + sequence_length > len(target_gaussians):
+    if target_start < 0 or target_frame >= len(target_gaussians):
         raise ValueError("Target transition sequence exceeds frame range.")
 
     if theta is None:
         theta = estimate_sequence_rotation(
             source_gaussians[start_frame : start_frame + sequence_length],
-            target_gaussians[target_start : target_start + sequence_length],
+            target_gaussians[target_start : target_frame + 1],
         )
 
     for local_idx in range(num_transition_frames):
@@ -342,12 +351,12 @@ def build_transitions_from_matrices(
             if not _is_local_minimum(distance_matrix, source_index, target_index):
                 continue
 
-            source_frame = _matrix_index_to_frame(
+            source_frame = _matrix_index_to_source_frame(
                 source_index,
                 source_index_mode,
                 window_size,
             )
-            target_frame = _matrix_index_to_frame(
+            target_frame = _matrix_index_to_target_frame(
                 target_index,
                 target_index_mode,
                 window_size,

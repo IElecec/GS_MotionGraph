@@ -2,6 +2,7 @@ import argparse
 import json
 from pathlib import Path
 from typing import Any, Dict, List
+from tqdm import tqdm
 
 from motion_graph.transition import (
     Transition,
@@ -40,12 +41,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="spherical harmonics degree used when loading Gaussian frames",
     )
     parser.add_argument(
-        "--num-transition-frames",
-        type=int,
-        default=4,
-        help="number of synthesized in-between frames for each transition",
-    )
-    parser.add_argument(
         "--max-transitions",
         type=int,
         default=0,
@@ -73,6 +68,41 @@ def load_transitions(payload: Dict[str, Any]) -> List[Transition]:
     return [transition_from_dict(item) for item in payload.get("transitions", [])]
 
 
+def resolve_num_transition_frames(payload: Dict[str, Any]) -> int:
+    window_size = payload.get("window_size")
+    if window_size is not None:
+        window_size = int(window_size)
+        if window_size < 2:
+            raise ValueError("motion_graph.json has invalid window_size; expected at least 2.")
+        return window_size - 2
+
+    transition_edge_length = payload.get("transition_edge_length")
+    if transition_edge_length is None:
+        transition_lengths = {
+            int(edge["length"])
+            for edge in payload.get("edges", [])
+            if edge.get("kind") == "transition" and "length" in edge
+        }
+        if len(transition_lengths) == 1:
+            transition_edge_length = next(iter(transition_lengths))
+        elif len(transition_lengths) > 1:
+            raise ValueError(
+                "motion_graph.json contains inconsistent transition edge lengths; rebuild the motion graph."
+            )
+
+    if transition_edge_length is None:
+        raise ValueError(
+            "motion_graph.json is missing window_size / transition_edge_length; rebuild the motion graph first."
+        )
+
+    transition_edge_length = int(transition_edge_length)
+    if transition_edge_length < 1:
+        raise ValueError(
+            "motion_graph.json has invalid transition_edge_length; expected at least 1."
+        )
+    return transition_edge_length - 1
+
+
 def export_transition_windows(
     database: Database,
     transitions: List[Transition],
@@ -84,7 +114,7 @@ def export_transition_windows(
     gaussian_cache = {}
     saved_dirs: List[Path] = []
 
-    for transition_idx, transition in enumerate(transitions):
+    for transition_idx, transition in enumerate(tqdm(transitions, desc="Exporting transition windows")):
         window = build_transition_window_from_database(
             database=database,
             transition=transition,
@@ -106,12 +136,11 @@ def export_transition_windows(
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.num_transition_frames < 0:
-        raise ValueError("--num-transition-frames must be non-negative")
 
     motion_graph_path = Path(args.motion_graph)
     payload = load_motion_graph_payload(motion_graph_path)
     database_dir = resolve_database_dir(args, payload)
+    num_transition_frames = resolve_num_transition_frames(payload)
     database = Database(database_dir)
 
     transitions = load_transitions(payload)
@@ -123,9 +152,12 @@ def main() -> None:
         transitions=transitions,
         output_dir=Path(args.output),
         sh_degree=args.sh_degree,
-        num_transition_frames=args.num_transition_frames,
+        num_transition_frames=num_transition_frames,
     )
-    print(f"Saved {len(saved_dirs)} transition windows to {args.output}")
+    print(
+        f"Saved {len(saved_dirs)} transition windows to {args.output} "
+        f"(num_transition_frames={num_transition_frames})"
+    )
 
 
 if __name__ == "__main__":

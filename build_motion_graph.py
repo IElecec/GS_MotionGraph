@@ -55,6 +55,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="limit rendered cross-action transition edges in the optional HTML output; <= 0 renders all",
     )
+    parser.add_argument(
+        "--visualization-fps",
+        type=float,
+        default=30.0,
+        help="logical playback fps used by the random walker in the optional HTML visualization",
+    )
     return parser
 
 
@@ -77,6 +83,7 @@ def main() -> None:
             payload=motion_graph.to_dict(),
             output_path=Path(args.visualization),
             max_transition_edges=args.max_visualized_transitions,
+            fps=args.visualization_fps,
         )
     print(
         f"Saved motion graph with {len(motion_graph.nodes)} nodes and "

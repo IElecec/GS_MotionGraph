@@ -2,13 +2,14 @@ import json
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from utils import Database
 
 from .transition import FrameRef, GraphEdge, Transition, build_transitions_from_matrices
 
 FrameKey = Tuple[str, str, int]
+TransitionKey = Tuple[FrameKey, FrameKey]
 
 
 def _resolve_similarity_dir(path: Path) -> Path:
@@ -86,34 +87,112 @@ def _frame_counts(database: Database) -> Dict[Tuple[str, str], int]:
     return counts
 
 
-def _build_sequence_nodes(database: Database) -> List[FrameRef]:
-    nodes: List[FrameRef] = []
-    for action in database.get_actions():
-        for animation in database.get_animations(action):
-            frames = database.get_frames(action, animation)
-            for frame_idx in range(len(frames)):
-                nodes.append(FrameRef(action=action, animation=animation, frame=frame_idx))
-    return nodes
+def _build_transition_nodes(transitions: List[Transition]) -> List[FrameRef]:
+    unique_nodes: Dict[FrameKey, FrameRef] = {}
+    for transition in transitions:
+        unique_nodes[transition.source.key()] = transition.source
+        unique_nodes[transition.target.key()] = transition.target
+    return [unique_nodes[key] for key in sorted(unique_nodes)]
 
 
-def _build_sequence_edges(database: Database) -> List[GraphEdge]:
+def _build_sequence_edges(nodes: List[FrameRef]) -> List[GraphEdge]:
+    grouped_nodes: Dict[Tuple[str, str], List[FrameRef]] = {}
+    for node in nodes:
+        grouped_nodes.setdefault((node.action, node.animation), []).append(node)
+
     edges: List[GraphEdge] = []
-    for action in database.get_actions():
-        for animation in database.get_animations(action):
-            frames = database.get_frames(action, animation)
-            for frame_idx in range(len(frames) - 1):
-                edges.append(
-                    GraphEdge(
-                        source=FrameRef(action=action, animation=animation, frame=frame_idx),
-                        target=FrameRef(
-                            action=action,
-                            animation=animation,
-                            frame=frame_idx + 1,
-                        ),
-                        kind="sequence",
-                    )
+    for refs in grouped_nodes.values():
+        refs.sort(key=lambda frame_ref: frame_ref.frame)
+        for source, target in zip(refs, refs[1:]):
+            if source.frame == target.frame:
+                continue
+            edges.append(
+                GraphEdge(
+                    source=source,
+                    target=target,
+                    kind="sequence",
+                    length=target.frame - source.frame,
                 )
+            )
     return edges
+
+
+def _transition_key(source: FrameRef, target: FrameRef) -> TransitionKey:
+    return (source.key(), target.key())
+
+
+def _transition_edge_length_lookup(edges: List[GraphEdge]) -> Dict[TransitionKey, int]:
+    lookup: Dict[TransitionKey, int] = {}
+    for edge in edges:
+        if edge.kind != "transition":
+            continue
+        lookup[_transition_key(edge.source, edge.target)] = int(edge.length)
+    return lookup
+
+
+def _build_transition_edges(
+    transitions: List[Transition],
+    default_length: int,
+    length_lookup: Optional[Dict[TransitionKey, int]] = None,
+) -> List[GraphEdge]:
+    edges: List[GraphEdge] = []
+    for transition in transitions:
+        length = default_length
+        if length_lookup is not None:
+            length = int(
+                length_lookup.get(
+                    _transition_key(transition.source, transition.target),
+                    default_length,
+                )
+            )
+        edges.append(
+            GraphEdge(
+                source=transition.source,
+                target=transition.target,
+                kind="transition",
+                length=length,
+                distance=transition.distance,
+                theta=transition.theta,
+            )
+        )
+    return edges
+
+
+def _transition_connected_keys(transitions: List[Transition]) -> Set[FrameKey]:
+    keep: Set[FrameKey] = set()
+    for transition in transitions:
+        keep.add(transition.source.key())
+        keep.add(transition.target.key())
+    return keep
+
+
+def _prune_nodes_without_transitions(
+    nodes: List[FrameRef],
+    edges: List[GraphEdge],
+    transitions: List[Transition],
+) -> Tuple[List[FrameRef], List[GraphEdge], List[Transition]]:
+    keep = _transition_connected_keys(transitions)
+    nodes = [node for node in nodes if node.key() in keep]
+    edges = [
+        edge
+        for edge in edges
+        if edge.source.key() in keep and edge.target.key() in keep
+    ]
+    return nodes, edges, transitions
+
+
+def _rebuild_graph_from_transitions(
+    transitions: List[Transition],
+    default_transition_length: int,
+    transition_length_lookup: Optional[Dict[TransitionKey, int]] = None,
+) -> Tuple[List[FrameRef], List[GraphEdge], List[Transition]]:
+    nodes = _build_transition_nodes(transitions)
+    edges = _build_sequence_edges(nodes) + _build_transition_edges(
+        transitions,
+        default_length=default_transition_length,
+        length_lookup=transition_length_lookup,
+    )
+    return _prune_nodes_without_transitions(nodes, edges, transitions)
 
 
 def _dfs(node: FrameKey, graph: Dict[FrameKey, List[FrameKey]], visited: Set[FrameKey], order: List[FrameKey]) -> None:
@@ -138,6 +217,7 @@ class MotionGraph:
     nodes: List[FrameRef] = field(default_factory=list)
     edges: List[GraphEdge] = field(default_factory=list)
     transitions: List[Transition] = field(default_factory=list)
+    window_size: Optional[int] = None
 
     @classmethod
     def build(
@@ -149,11 +229,11 @@ class MotionGraph:
         prune_dead_ends: bool = True,
     ) -> "MotionGraph":
         similarity_root = _resolve_similarity_dir(similarity_dir)
-        nodes = _build_sequence_nodes(database)
-        edges = _build_sequence_edges(database)
         transitions: List[Transition] = []
+        transition_edges: List[GraphEdge] = []
         frame_counts = _frame_counts(database)
         found_similarity_file = False
+        observed_window_sizes: Set[int] = set()
 
         for similarity_file in sorted(similarity_root.rglob("similarity.pt")):
             found_similarity_file = True
@@ -166,6 +246,7 @@ class MotionGraph:
             distance_matrix = payload["distance_matrix"]
             angle_matrix = payload["angle_matrix"]
             window_size = int(payload.get("window_size", _infer_window_size(distance_matrix)))
+            observed_window_sizes.add(window_size)
             source_index_mode = payload.get("source_index_mode", "window_start")
             target_index_mode = payload.get(
                 "target_index_mode",
@@ -192,11 +273,12 @@ class MotionGraph:
             transitions.extend(pair_transitions)
 
             for transition in pair_transitions:
-                edges.append(
+                transition_edges.append(
                     GraphEdge(
                         source=transition.source,
                         target=transition.target,
                         kind="transition",
+                        length=max(0, window_size - 1),
                         distance=transition.distance,
                         theta=transition.theta,
                     )
@@ -207,11 +289,22 @@ class MotionGraph:
                 f"No similarity.pt files found under {similarity_root}"
             )
 
+        transition_length_lookup = _transition_edge_length_lookup(transition_edges)
+        default_transition_length = 0
+        if observed_window_sizes:
+            default_transition_length = max(0, min(observed_window_sizes) - 1)
+        nodes, edges, transitions = _rebuild_graph_from_transitions(
+            transitions,
+            default_transition_length=default_transition_length,
+            transition_length_lookup=transition_length_lookup,
+        )
+
         graph = cls(
             database=database,
             nodes=nodes,
             edges=edges,
             transitions=transitions,
+            window_size=next(iter(observed_window_sizes)) if len(observed_window_sizes) == 1 else None,
         )
         if prune_dead_ends:
             return graph.largest_strongly_connected_component()
@@ -259,16 +352,32 @@ class MotionGraph:
             for transition in self.transitions
             if transition.source.key() in keep and transition.target.key() in keep
         ]
+        transition_length_lookup = _transition_edge_length_lookup(edges)
+        default_transition_length = 0
+        if self.window_size is not None:
+            default_transition_length = max(0, int(self.window_size) - 1)
+        nodes, edges, transitions = _rebuild_graph_from_transitions(
+            transitions,
+            default_transition_length=default_transition_length,
+            transition_length_lookup=transition_length_lookup,
+        )
         return MotionGraph(
             database=self.database,
             nodes=nodes,
             edges=edges,
             transitions=transitions,
+            window_size=self.window_size,
         )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "database_dir": str(self.database.base_dir),
+            "node_mode": "transition_only",
+            "sequence_edge_mode": "between_consecutive_transition_nodes",
+            "source_frame_semantics": "window_start",
+            "target_frame_semantics": "window_end",
+            "window_size": self.window_size,
+            "transition_edge_length": None if self.window_size is None else max(0, self.window_size - 1),
             "num_nodes": len(self.nodes),
             "num_edges": len(self.edges),
             "num_transitions": len(self.transitions),

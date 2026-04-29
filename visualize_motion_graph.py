@@ -7,7 +7,6 @@ from typing import Any, Dict, List, Tuple
 
 NodeKey = Tuple[str, str, int]
 LaneKey = Tuple[str, str]
-ActionPair = Tuple[str, str]
 
 
 class UnionFind:
@@ -61,13 +60,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--frame-spacing",
         type=int,
-        default=36,
-        help="horizontal spacing per frame",
+        default=58,
+        help="horizontal spacing between displayed transition nodes",
     )
     parser.add_argument(
         "--lane-spacing",
         type=int,
-        default=110,
+        default=72,
         help="vertical spacing per animation lane",
     )
     parser.add_argument(
@@ -75,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="limit rendered cross-action transition edges; <= 0 renders all",
+    )
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=30.0,
+        help="logical playback fps used by the random walker; edge traversal time is edge.length / fps",
     )
     return parser
 
@@ -90,6 +95,60 @@ def lane_key(node: Dict[str, Any]) -> LaneKey:
 
 def node_key(node: Dict[str, Any]) -> NodeKey:
     return (node["action"], node["animation"], int(node["frame"]))
+
+
+def node_id(node: Dict[str, Any]) -> str:
+    return f"{node['action']}|{node['animation']}|{int(node['frame'])}"
+
+
+def transition_edge_length(payload: Dict[str, Any]) -> int:
+    value = payload.get("transition_edge_length")
+    if value is not None:
+        return max(0, int(value))
+
+    window_size = payload.get("window_size")
+    if window_size is not None:
+        return max(0, int(window_size) - 1)
+    return 0
+
+
+def normalize_motion_graph_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    transitions = list(payload.get("transitions", []))
+    default_transition_edge_length = transition_edge_length(payload)
+
+    keep_keys = set()
+    for transition in transitions:
+        keep_keys.add(node_key(transition["source"]))
+        keep_keys.add(node_key(transition["target"]))
+
+    if keep_keys:
+        payload["nodes"] = [
+            node for node in payload.get("nodes", [])
+            if node_key(node) in keep_keys
+        ]
+
+    normalized_edges: List[Dict[str, Any]] = []
+    for edge in payload.get("edges", []):
+        source_key = node_key(edge["source"])
+        target_key = node_key(edge["target"])
+        if keep_keys and (source_key not in keep_keys or target_key not in keep_keys):
+            continue
+
+        edge = dict(edge)
+        if "length" not in edge:
+            if edge.get("kind") == "sequence":
+                edge["length"] = abs(int(edge["target"]["frame"]) - int(edge["source"]["frame"]))
+            elif edge.get("kind") == "transition":
+                edge["length"] = int(default_transition_edge_length)
+            else:
+                edge["length"] = 0
+        normalized_edges.append(edge)
+
+    payload["edges"] = normalized_edges
+    payload["num_nodes"] = len(payload.get("nodes", []))
+    payload["num_edges"] = len(payload.get("edges", []))
+    payload["num_transitions"] = len(transitions)
+    return payload
 
 
 def transition_sort_key(item: Dict[str, Any]) -> float:
@@ -151,59 +210,7 @@ def trim_quadratic_path(
     return x1, y1, x2, y2
 
 
-def build_layout(
-    nodes: List[Dict[str, Any]],
-    frame_spacing: int,
-    lane_spacing: int,
-) -> Tuple[Dict[NodeKey, Tuple[int, int]], List[LaneKey], int, int, int]:
-    lanes = sorted({lane_key(node) for node in nodes})
-    lane_to_index = {lane: idx for idx, lane in enumerate(lanes)}
-
-    max_frame = max((int(node["frame"]) for node in nodes), default=0)
-    positions: Dict[NodeKey, Tuple[int, int]] = {}
-
-    x_margin = 170
-    y_margin = 70
-    for node in nodes:
-        key = node_key(node)
-        lane = lane_key(node)
-        x = x_margin + int(node["frame"]) * frame_spacing
-        y = y_margin + lane_to_index[lane] * lane_spacing
-        positions[key] = (x, y)
-
-    width = x_margin + max(1, max_frame + 1) * frame_spacing + 120
-    height = y_margin + max(1, len(lanes)) * lane_spacing + 80
-    return positions, lanes, width, height, max_frame
-
-
-def render_lane_labels(lanes: List[LaneKey], lane_spacing: int, width: int) -> str:
-    y_margin = 70
-    parts: List[str] = []
-    for lane_idx, (action, animation) in enumerate(lanes):
-        y = y_margin + lane_idx * lane_spacing
-        label = html.escape(f"{action} / {animation}")
-        parts.append(f'<text x="20" y="{y + 5}" class="lane-label">{label}</text>')
-        parts.append(
-            f'<line x1="150" y1="{y}" x2="{width - 30}" y2="{y}" class="lane-guide" />'
-        )
-    return "\n".join(parts)
-
-
-def render_frame_ticks(max_frame: int, frame_spacing: int, height: int) -> str:
-    x_margin = 170
-    y = 36
-    parts: List[str] = []
-    step = max(1, int(math.ceil(max_frame / 12))) if max_frame > 0 else 1
-    for frame_idx in range(0, max_frame + 1, step):
-        x = x_margin + frame_idx * frame_spacing
-        parts.append(
-            f'<line x1="{x}" y1="40" x2="{x}" y2="{height - 20}" class="frame-guide" />'
-        )
-        parts.append(f'<text x="{x}" y="{y}" class="frame-label">{frame_idx}</text>')
-    return "\n".join(parts)
-
-
-def render_marker_defs() -> str:
+def build_marker_defs() -> str:
     return """
     <defs>
       <marker id="arrow-sequence" markerWidth="11" markerHeight="11" refX="8" refY="5.5" orient="auto" markerUnits="strokeWidth">
@@ -217,106 +224,6 @@ def render_marker_defs() -> str:
       </marker>
     </defs>
     """
-
-
-def render_edges(
-    items: List[Dict[str, Any]],
-    positions: Dict[NodeKey, Tuple[int, int]],
-    css_class: str,
-    kind: str,
-    marker_id: str,
-) -> str:
-    parts: List[str] = []
-    for item in items:
-        source = node_key(item["source"])
-        target = node_key(item["target"])
-        if source not in positions or target not in positions:
-            continue
-
-        x1, y1 = positions[source]
-        x2, y2 = positions[target]
-        x1, y1, x2, y2 = trim_line(
-            x1,
-            y1,
-            x2,
-            y2,
-            start_padding=6.0,
-            end_padding=10.0,
-        )
-        tooltip = html.escape(
-            f"{kind}: {source[0]}/{source[1]}/{source[2]} -> {target[0]}/{target[1]}/{target[2]}"
-        )
-        parts.append(
-            (
-                f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" class="{css_class}" marker-end="url(#{marker_id})">'
-                f"<title>{tooltip}</title></line>"
-            )
-        )
-    return "\n".join(parts)
-
-
-def render_curved_transitions(
-    transitions: List[Dict[str, Any]],
-    positions: Dict[NodeKey, Tuple[int, int]],
-    css_class: str,
-    marker_id: str,
-    start_padding: float = 6.0,
-    end_padding: float = 10.0,
-) -> str:
-    parts: List[str] = []
-    for transition in transitions:
-        source = node_key(transition["source"])
-        target = node_key(transition["target"])
-        if source not in positions or target not in positions:
-            continue
-
-        x1, y1 = positions[source]
-        x2, y2 = positions[target]
-        dx = x2 - x1
-        dy = y2 - y1
-        curve_height = max(28.0, min(180.0, abs(dx) * 0.25 + abs(dy) * 0.3))
-        cx = (x1 + x2) / 2.0
-        cy = min(y1, y2) - curve_height if y1 != y2 else y1 - curve_height
-        x1, y1, x2, y2 = trim_quadratic_path(
-            x1,
-            y1,
-            cx,
-            cy,
-            x2,
-            y2,
-            start_padding=start_padding,
-            end_padding=end_padding,
-        )
-        path = f"M {x1:.1f} {y1:.1f} Q {cx:.1f} {cy:.1f} {x2:.1f} {y2:.1f}"
-        tooltip = html.escape(
-            (
-                f"transition: {source[0]}/{source[1]}/{source[2]} -> "
-                f"{target[0]}/{target[1]}/{target[2]} | "
-                f"distance={transition.get('distance', 0.0):.4f} | "
-                f"theta={transition.get('theta', 0.0):.4f}"
-            )
-        )
-        parts.append(
-            f'<path d="{path}" class="{css_class}" marker-end="url(#{marker_id})"><title>{tooltip}</title></path>'
-        )
-    return "\n".join(parts)
-
-
-def render_nodes(
-    nodes: List[Dict[str, Any]],
-    positions: Dict[NodeKey, Tuple[int, int]],
-) -> str:
-    parts: List[str] = []
-    for node in nodes:
-        key = node_key(node)
-        if key not in positions:
-            continue
-        x, y = positions[key]
-        tooltip = html.escape(f"{node['action']}/{node['animation']}/{node['frame']}")
-        parts.append(
-            f'<circle cx="{x}" cy="{y}" r="4" class="node"><title>{tooltip}</title></circle>'
-        )
-    return "\n".join(parts)
 
 
 def group_nodes_by_action(payload: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
@@ -337,6 +244,46 @@ def get_action_sequence_edges(payload: Dict[str, Any], action: str) -> List[Dict
     return edges
 
 
+def build_sequence_edges_from_nodes(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped_by_lane: Dict[LaneKey, List[Dict[str, Any]]] = {}
+    for node in nodes:
+        grouped_by_lane.setdefault(lane_key(node), []).append(node)
+
+    edges: List[Dict[str, Any]] = []
+    for lane_nodes in grouped_by_lane.values():
+        lane_nodes = sorted(lane_nodes, key=lambda item: int(item["frame"]))
+        for source, target in zip(lane_nodes, lane_nodes[1:]):
+            source_frame = int(source["frame"])
+            target_frame = int(target["frame"])
+            if source_frame == target_frame:
+                continue
+            edges.append(
+                {
+                    "source": source,
+                    "target": target,
+                    "kind": "sequence",
+                    "length": abs(target_frame - source_frame),
+                    "distance": 0.0,
+                    "theta": 0.0,
+                }
+            )
+    return edges
+
+
+def transition_to_edge_item(
+    payload: Dict[str, Any],
+    transition: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "source": transition["source"],
+        "target": transition["target"],
+        "kind": "transition",
+        "length": transition_edge_length(payload),
+        "distance": float(transition.get("distance", 0.0)),
+        "theta": float(transition.get("theta", 0.0)),
+    }
+
+
 def get_action_internal_transitions(
     payload: Dict[str, Any],
     action: str,
@@ -347,8 +294,23 @@ def get_action_internal_transitions(
             continue
         if transition["target"]["action"] != action:
             continue
-        transitions.append(transition)
+        transitions.append(transition_to_edge_item(payload, transition))
     transitions.sort(key=transition_sort_key)
+    return transitions
+
+
+def get_cross_action_transitions(
+    payload: Dict[str, Any],
+    max_transition_edges: int,
+) -> List[Dict[str, Any]]:
+    transitions = [
+        transition_to_edge_item(payload, transition)
+        for transition in payload.get("transitions", [])
+        if transition["source"]["action"] != transition["target"]["action"]
+    ]
+    transitions.sort(key=transition_sort_key)
+    if max_transition_edges > 0:
+        return transitions[:max_transition_edges]
     return transitions
 
 
@@ -373,203 +335,481 @@ def build_minimal_action_graph(
     return selected, union_find.component_count()
 
 
-def render_action_panel(
-    action: str,
+def count_components(
     nodes: List[Dict[str, Any]],
+    edges: List[Dict[str, Any]],
+) -> int:
+    if not nodes:
+        return 0
+
+    union_find = UnionFind([node_key(node) for node in nodes])
+    for edge in edges:
+        union_find.union(node_key(edge["source"]), node_key(edge["target"]))
+    return union_find.component_count()
+
+
+def build_cluster_local_layout(
+    nodes: List[Dict[str, Any]],
+    frame_spacing: int,
+    lane_spacing: int,
+) -> Tuple[Dict[NodeKey, Tuple[float, float]], List[LaneKey], int]:
+    grouped_by_lane: Dict[LaneKey, List[Dict[str, Any]]] = {}
+    for node in nodes:
+        grouped_by_lane.setdefault(lane_key(node), []).append(node)
+
+    lanes = sorted(grouped_by_lane)
+    x_margin = 126
+    y_margin = 78
+    positions: Dict[NodeKey, Tuple[float, float]] = {}
+    max_nodes_per_lane = 0
+
+    for lane_idx, lane in enumerate(lanes):
+        lane_nodes = sorted(grouped_by_lane[lane], key=lambda item: int(item["frame"]))
+        max_nodes_per_lane = max(max_nodes_per_lane, len(lane_nodes))
+        for node_idx, node in enumerate(lane_nodes):
+            x = x_margin + node_idx * frame_spacing
+            y = y_margin + lane_idx * lane_spacing
+            positions[node_key(node)] = (x, y)
+
+    return positions, lanes, max_nodes_per_lane
+
+
+def build_action_clusters(
     payload: Dict[str, Any],
     frame_spacing: int,
     lane_spacing: int,
-) -> str:
-    sequence_edges = get_action_sequence_edges(payload, action)
-    internal_transitions = get_action_internal_transitions(payload, action)
-    bridge_transitions, component_count = build_minimal_action_graph(
-        nodes,
-        sequence_edges,
-        internal_transitions,
-    )
-    positions, lanes, width, height, max_frame = build_layout(
-        nodes,
-        frame_spacing,
-        lane_spacing,
-    )
+    max_transition_edges: int,
+) -> Tuple[List[Dict[str, Any]], Dict[NodeKey, Tuple[float, float]], int, int, List[Dict[str, Any]]]:
+    grouped_nodes = group_nodes_by_action(payload)
+    action_names = sorted(grouped_nodes)
+    cross_action_transitions = get_cross_action_transitions(payload, max_transition_edges)
+    visible_transition_keys = {
+        node_key(edge["source"]) for edge in cross_action_transitions
+    } | {
+        node_key(edge["target"]) for edge in cross_action_transitions
+    }
+    bridge_transitions_by_action: Dict[str, List[Dict[str, Any]]] = {}
 
-    lane_labels = render_lane_labels(lanes, lane_spacing, width)
-    frame_ticks = render_frame_ticks(max_frame, frame_spacing, height)
-    sequence_html = render_edges(
-        sequence_edges,
-        positions,
-        css_class="sequence-edge",
-        kind="sequence",
-        marker_id="arrow-sequence",
-    )
-    transition_html = render_curved_transitions(
-        bridge_transitions,
-        positions,
-        css_class="intra-transition-edge",
-        marker_id="arrow-intra",
-    )
-    node_html = render_nodes(nodes, positions)
-    marker_defs = render_marker_defs()
+    for action in action_names:
+        nodes = grouped_nodes[action]
+        sequence_edges = build_sequence_edges_from_nodes(nodes)
+        internal_transitions = get_action_internal_transitions(payload, action)
+        bridge_transitions, component_count = build_minimal_action_graph(
+            nodes,
+            sequence_edges,
+            internal_transitions,
+        )
+        bridge_transitions_by_action[action] = bridge_transitions
+        del component_count
+        for edge in bridge_transitions:
+            visible_transition_keys.add(node_key(edge["source"]))
+            visible_transition_keys.add(node_key(edge["target"]))
 
+    clusters: List[Dict[str, Any]] = []
+    cross_action_transitions = [
+        edge
+        for edge in cross_action_transitions
+        if node_key(edge["source"]) in visible_transition_keys
+        and node_key(edge["target"]) in visible_transition_keys
+    ]
+    if not visible_transition_keys:
+        return [], {}, 56, 56, []
+
+    for action in action_names:
+        nodes = [
+            node
+            for node in grouped_nodes[action]
+            if node_key(node) in visible_transition_keys
+        ]
+        if not nodes:
+            continue
+
+        sequence_edges = build_sequence_edges_from_nodes(nodes)
+        bridge_transitions = [
+            edge
+            for edge in bridge_transitions_by_action[action]
+            if node_key(edge["source"]) in visible_transition_keys
+            and node_key(edge["target"]) in visible_transition_keys
+        ]
+        component_count = count_components(
+            nodes,
+            sequence_edges + bridge_transitions,
+        )
+        local_positions, lanes, max_nodes_per_lane = build_cluster_local_layout(
+            nodes,
+            frame_spacing,
+            lane_spacing,
+        )
+        width = 126 + max(1, max_nodes_per_lane) * frame_spacing + 86
+        height = 78 + max(1, len(lanes) - 1) * lane_spacing + 78
+        clusters.append(
+            {
+                "action": action,
+                "nodes": nodes,
+                "sequence_edges": sequence_edges,
+                "bridge_transitions": bridge_transitions,
+                "component_count": component_count,
+                "lanes": lanes,
+                "lane_spacing": lane_spacing,
+                "width": width,
+                "height": height,
+                "local_positions": local_positions,
+            }
+        )
+
+    column_count = 1 if len(clusters) <= 1 else 2 if len(clusters) <= 4 else 3
+    row_count = (len(clusters) + column_count - 1) // column_count
+    column_widths = [0] * column_count
+    row_heights = [0] * row_count
+
+    for index, cluster in enumerate(clusters):
+        row_idx = index // column_count
+        col_idx = index % column_count
+        column_widths[col_idx] = max(column_widths[col_idx], cluster["width"])
+        row_heights[row_idx] = max(row_heights[row_idx], cluster["height"])
+
+    outer_margin = 28
+    column_gap = 30
+    row_gap = 34
+    x_offsets = [outer_margin]
+    for width in column_widths[:-1]:
+        x_offsets.append(x_offsets[-1] + width + column_gap)
+    y_offsets = [outer_margin]
+    for height in row_heights[:-1]:
+        y_offsets.append(y_offsets[-1] + height + row_gap)
+
+    global_positions: Dict[NodeKey, Tuple[float, float]] = {}
+    for index, cluster in enumerate(clusters):
+        row_idx = index // column_count
+        col_idx = index % column_count
+        cluster["x"] = x_offsets[col_idx]
+        cluster["y"] = y_offsets[row_idx]
+        cluster["positions"] = {}
+        for key, (x, y) in cluster["local_positions"].items():
+            global_position = (cluster["x"] + x, cluster["y"] + y)
+            cluster["positions"][key] = global_position
+            global_positions[key] = global_position
+
+    total_width = outer_margin + sum(column_widths) + column_gap * max(0, column_count - 1) + outer_margin
+    total_height = outer_margin + sum(row_heights) + row_gap * max(0, row_count - 1) + outer_margin
+    return clusters, global_positions, total_width, total_height, cross_action_transitions
+
+
+def render_cluster_box(cluster: Dict[str, Any]) -> str:
+    title = html.escape(cluster["action"])
     summary = html.escape(
         (
-            f"animations={len(lanes)}, nodes={len(nodes)}, "
-            f"sequence edges={len(sequence_edges)}, bridge transitions={len(bridge_transitions)}, "
-            f"remaining components={component_count}"
+            f"animations={len(cluster['lanes'])}, nodes={len(cluster['nodes'])}, "
+            f"sequence={len(cluster['sequence_edges'])}, bridges={len(cluster['bridge_transitions'])}, "
+            f"components={cluster['component_count']}"
         )
     )
-
-    return f"""
-    <section class="panel">
-      <h2>{html.escape(action)}</h2>
-      <div class="summary">{summary}</div>
-      <div class="canvas">
-        <svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">
-          {marker_defs}
-          {frame_ticks}
-          {lane_labels}
-          <g>{sequence_html}</g>
-          <g>{transition_html}</g>
-          <g>{node_html}</g>
-        </svg>
-      </div>
-    </section>
-    """
-
-
-def build_cross_action_groups(payload: Dict[str, Any]) -> Dict[ActionPair, List[Dict[str, Any]]]:
-    groups: Dict[ActionPair, List[Dict[str, Any]]] = {}
-    for transition in payload.get("transitions", []):
-        source_action = transition["source"]["action"]
-        target_action = transition["target"]["action"]
-        if source_action == target_action:
-            continue
-        groups.setdefault((source_action, target_action), []).append(transition)
-
-    for group in groups.values():
-        group.sort(key=transition_sort_key)
-    return groups
-
-
-def render_cross_action_panel(
-    payload: Dict[str, Any],
-    max_transition_edges: int,
-) -> str:
-    groups = build_cross_action_groups(payload)
-    group_items = sorted(
-        groups.items(),
-        key=lambda item: transition_sort_key(item[1][0]) if item[1] else float("inf"),
+    return (
+        f'<rect x="{cluster["x"]:.1f}" y="{cluster["y"]:.1f}" '
+        f'width="{cluster["width"]:.1f}" height="{cluster["height"]:.1f}" '
+        f'rx="14" class="cluster-box" />'
+        f'<text x="{cluster["x"] + 16:.1f}" y="{cluster["y"] + 24:.1f}" class="cluster-title">{title}</text>'
+        f'<text x="{cluster["x"] + 16:.1f}" y="{cluster["y"] + 42:.1f}" class="cluster-summary">{summary}</text>'
     )
-    if max_transition_edges > 0:
-        group_items = group_items[:max_transition_edges]
 
-    actions = sorted({node["action"] for node in payload.get("nodes", [])})
-    if not actions:
-        return ""
 
-    width = max(680, 180 * len(actions) + 120)
-    height = 320
-    y = 180
-    positions: Dict[str, Tuple[float, float]] = {}
-    step = (width - 140) / max(1, len(actions) - 1) if len(actions) > 1 else 0.0
-    for index, action in enumerate(actions):
-        x = 70 + step * index if len(actions) > 1 else width / 2.0
-        positions[action] = (x, y)
+def render_cluster_guides(cluster: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    lane_left = cluster["x"] + 112
+    lane_right = cluster["x"] + cluster["width"] - 18
+    for lane_idx, (action, animation) in enumerate(cluster["lanes"]):
+        y = cluster["y"] + 78 + lane_idx * cluster["lane_spacing"]
+        label = html.escape(f"{action} / {animation}")
+        parts.append(
+            f'<text x="{cluster["x"] + 16:.1f}" y="{y + 4:.1f}" class="lane-label">{label}</text>'
+        )
+        parts.append(
+            f'<line x1="{lane_left:.1f}" y1="{y:.1f}" x2="{lane_right:.1f}" y2="{y:.1f}" class="lane-guide" />'
+        )
+    return "\n".join(parts)
 
-    path_parts: List[str] = []
-    label_parts: List[str] = []
-    for (source_action, target_action), transitions in group_items:
-        if source_action not in positions or target_action not in positions:
+
+def render_node_frame_labels(
+    nodes: List[Dict[str, Any]],
+    positions: Dict[NodeKey, Tuple[float, float]],
+) -> str:
+    parts: List[str] = []
+    for node in nodes:
+        key = node_key(node)
+        if key not in positions:
             continue
+        x, y = positions[key]
+        parts.append(
+            f'<text x="{x:.1f}" y="{y + 16:.1f}" class="node-frame-label">{int(node["frame"])}</text>'
+        )
+    return "\n".join(parts)
 
-        x1, y1 = positions[source_action]
-        x2, y2 = positions[target_action]
-        if x1 == x2 and y1 == y2:
+
+def render_nodes(
+    nodes: List[Dict[str, Any]],
+    positions: Dict[NodeKey, Tuple[float, float]],
+) -> str:
+    parts: List[str] = []
+    for node in nodes:
+        key = node_key(node)
+        if key not in positions:
             continue
+        x, y = positions[key]
+        tooltip = html.escape(f"{node['action']}/{node['animation']}/{node['frame']}")
+        parts.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4.4" class="node"><title>{tooltip}</title></circle>'
+        )
+    return "\n".join(parts)
 
-        curve_sign = -1.0 if x1 < x2 else 1.0
-        curve_height = 60.0 + min(100.0, abs(x2 - x1) * 0.15)
-        cx = (x1 + x2) / 2.0
-        cy = y - curve_sign * curve_height
-        path = f"M {x1:.1f} {y1:.1f} Q {cx:.1f} {cy:.1f} {x2:.1f} {y2:.1f}"
 
-        sample_lines = []
-        for transition in transitions[:4]:
-            sample_lines.append(
-                (
-                    f"{transition['source']['animation']}/{transition['source']['frame']} -> "
-                    f"{transition['target']['animation']}/{transition['target']['frame']} "
-                    f"(d={transition.get('distance', 0.0):.4f})"
+def build_line_edge_descriptor(
+    edge_id: str,
+    item: Dict[str, Any],
+    positions: Dict[NodeKey, Tuple[float, float]],
+    css_class: str,
+    marker_id: str,
+    kind_label: str,
+) -> Dict[str, Any]:
+    source = node_key(item["source"])
+    target = node_key(item["target"])
+    x1, y1 = positions[source]
+    x2, y2 = positions[target]
+    x1, y1, x2, y2 = trim_line(x1, y1, x2, y2, 6.0, 10.0)
+    tooltip = html.escape(
+        f"{kind_label}: {source[0]}/{source[1]}/{source[2]} -> {target[0]}/{target[1]}/{target[2]} | length={int(item.get('length', 0))}"
+    )
+    return {
+        "id": edge_id,
+        "source_id": node_id(item["source"]),
+        "target_id": node_id(item["target"]),
+        "css_class": css_class,
+        "marker_id": marker_id,
+        "path_d": f"M {x1:.1f} {y1:.1f} L {x2:.1f} {y2:.1f}",
+        "tooltip": tooltip,
+        "length": int(item.get("length", 0)),
+    }
+
+
+def build_internal_transition_descriptor(
+    edge_id: str,
+    item: Dict[str, Any],
+    positions: Dict[NodeKey, Tuple[float, float]],
+    css_class: str,
+    marker_id: str,
+) -> Dict[str, Any]:
+    source = node_key(item["source"])
+    target = node_key(item["target"])
+    x1, y1 = positions[source]
+    x2, y2 = positions[target]
+    dx = x2 - x1
+    dy = y2 - y1
+    curve_height = max(16.0, min(72.0, abs(dx) * 0.18 + abs(dy) * 0.26))
+    cx = (x1 + x2) / 2.0
+    cy = min(y1, y2) - curve_height if y1 != y2 else y1 - curve_height
+    x1, y1, x2, y2 = trim_quadratic_path(x1, y1, cx, cy, x2, y2, 6.0, 10.0)
+    tooltip = html.escape(
+        (
+            f"transition: {source[0]}/{source[1]}/{source[2]} -> "
+            f"{target[0]}/{target[1]}/{target[2]} | "
+            f"length={int(item.get('length', 0))} | "
+            f"distance={item.get('distance', 0.0):.4f} | "
+            f"theta={item.get('theta', 0.0):.4f}"
+        )
+    )
+    return {
+        "id": edge_id,
+        "source_id": node_id(item["source"]),
+        "target_id": node_id(item["target"]),
+        "css_class": css_class,
+        "marker_id": marker_id,
+        "path_d": f"M {x1:.1f} {y1:.1f} Q {cx:.1f} {cy:.1f} {x2:.1f} {y2:.1f}",
+        "tooltip": tooltip,
+        "length": int(item.get("length", 0)),
+    }
+
+
+def build_cross_transition_descriptor(
+    edge_id: str,
+    item: Dict[str, Any],
+    positions: Dict[NodeKey, Tuple[float, float]],
+    css_class: str,
+    marker_id: str,
+) -> Dict[str, Any]:
+    source = node_key(item["source"])
+    target = node_key(item["target"])
+    x1, y1 = positions[source]
+    x2, y2 = positions[target]
+    dx = x2 - x1
+    dy = y2 - y1
+    distance = max(1.0, math.hypot(dx, dy))
+    offset = min(110.0, 18.0 + distance * 0.14)
+    nx = -dy / distance
+    ny = dx / distance
+    sign = 1.0 if node_id(item["source"]) < node_id(item["target"]) else -1.0
+    cx = (x1 + x2) / 2.0 + nx * offset * sign
+    cy = (y1 + y2) / 2.0 + ny * offset * sign
+    x1, y1, x2, y2 = trim_quadratic_path(x1, y1, cx, cy, x2, y2, 7.0, 11.0)
+    tooltip = html.escape(
+        (
+            f"cross-action: {source[0]}/{source[1]}/{source[2]} -> "
+            f"{target[0]}/{target[1]}/{target[2]} | "
+            f"length={int(item.get('length', 0))} | "
+            f"distance={item.get('distance', 0.0):.4f} | "
+            f"theta={item.get('theta', 0.0):.4f}"
+        )
+    )
+    return {
+        "id": edge_id,
+        "source_id": node_id(item["source"]),
+        "target_id": node_id(item["target"]),
+        "css_class": css_class,
+        "marker_id": marker_id,
+        "path_d": f"M {x1:.1f} {y1:.1f} Q {cx:.1f} {cy:.1f} {x2:.1f} {y2:.1f}",
+        "tooltip": tooltip,
+        "length": int(item.get("length", 0)),
+    }
+
+
+def build_visible_edges(
+    clusters: List[Dict[str, Any]],
+    positions: Dict[NodeKey, Tuple[float, float]],
+    cross_action_transitions: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    edge_descriptors: List[Dict[str, Any]] = []
+    next_edge_idx = 0
+
+    for cluster in clusters:
+        for item in cluster["sequence_edges"]:
+            edge_descriptors.append(
+                build_line_edge_descriptor(
+                    edge_id=f"edge_{next_edge_idx}",
+                    item=item,
+                    positions=positions,
+                    css_class="sequence-edge",
+                    marker_id="arrow-sequence",
+                    kind_label="sequence",
                 )
             )
-        tooltip = html.escape(
-            (
-                f"{source_action} -> {target_action} | count={len(transitions)} | "
-                f"best_distance={transition_sort_key(transitions[0]):.4f} | "
-                f"samples: {'; '.join(sample_lines)}"
+            next_edge_idx += 1
+
+        for item in cluster["bridge_transitions"]:
+            edge_descriptors.append(
+                build_internal_transition_descriptor(
+                    edge_id=f"edge_{next_edge_idx}",
+                    item=item,
+                    positions=positions,
+                    css_class="intra-transition-edge",
+                    marker_id="arrow-intra",
+                )
+            )
+            next_edge_idx += 1
+
+    for item in cross_action_transitions:
+        edge_descriptors.append(
+            build_cross_transition_descriptor(
+                edge_id=f"edge_{next_edge_idx}",
+                item=item,
+                positions=positions,
+                css_class="cross-transition-edge",
+                marker_id="arrow-cross",
             )
         )
-        label_y = cy - 8 if cy < y else cy + 18
-        label = html.escape(f"{source_action} -> {target_action} ({len(transitions)})")
+        next_edge_idx += 1
 
-        x1, y1, x2, y2 = trim_quadratic_path(
-            x1,
-            y1,
-            cx,
-            cy,
-            x2,
-            y2,
-            start_padding=68.0,
-            end_padding=72.0,
-        )
-        path = f"M {x1:.1f} {y1:.1f} Q {cx:.1f} {cy:.1f} {x2:.1f} {y2:.1f}"
+    return edge_descriptors
 
-        path_parts.append(
-            f'<path d="{path}" class="cross-transition-edge" marker-end="url(#arrow-cross)"><title>{tooltip}</title></path>'
-        )
-        label_parts.append(
-            f'<text x="{cx:.1f}" y="{label_y:.1f}" class="cross-label">{label}</text>'
-        )
 
-    node_parts: List[str] = []
-    for action, (x, y_pos) in positions.items():
-        label = html.escape(action)
-        node_parts.append(
-            f'<rect x="{x - 60:.1f}" y="{y_pos - 24:.1f}" width="120" height="48" rx="12" class="action-box" />'
+def render_visible_edges(edge_descriptors: List[Dict[str, Any]]) -> str:
+    parts: List[str] = []
+    for edge in edge_descriptors:
+        parts.append(
+            (
+                f'<path id="{edge["id"]}" d="{edge["path_d"]}" class="{edge["css_class"]}" '
+                f'marker-end="url(#{edge["marker_id"]})"><title>{edge["tooltip"]}</title></path>'
+            )
         )
-        node_parts.append(
-            f'<text x="{x:.1f}" y="{y_pos + 5:.1f}" class="action-box-label">{label}</text>'
-        )
+    return "\n".join(parts)
 
+
+def build_walker_payload(
+    nodes: List[Dict[str, Any]],
+    positions: Dict[NodeKey, Tuple[float, float]],
+    edge_descriptors: List[Dict[str, Any]],
+    fps: float,
+) -> Dict[str, Any]:
+    node_positions = {
+        node_id(node): [round(positions[node_key(node)][0], 3), round(positions[node_key(node)][1], 3)]
+        for node in nodes
+        if node_key(node) in positions
+    }
+    outgoing: Dict[str, List[str]] = {}
+    for edge in edge_descriptors:
+        outgoing.setdefault(edge["source_id"], []).append(edge["id"])
+    return {
+        "fps": float(fps),
+        "nodes": node_positions,
+        "outgoing": outgoing,
+        "edges": {
+            edge["id"]: {
+                "source": edge["source_id"],
+                "target": edge["target_id"],
+                "length": int(edge.get("length", 0)),
+            }
+            for edge in edge_descriptors
+        },
+    }
+
+
+def render_svg(
+    payload: Dict[str, Any],
+    frame_spacing: int,
+    lane_spacing: int,
+    max_transition_edges: int,
+    fps: float,
+) -> Tuple[str, str, str]:
+    clusters, positions, width, height, cross_action_transitions = build_action_clusters(
+        payload,
+        frame_spacing,
+        lane_spacing,
+        max_transition_edges,
+    )
+    edge_descriptors = build_visible_edges(
+        clusters,
+        positions,
+        cross_action_transitions,
+    )
+    all_nodes = [node for cluster in clusters for node in cluster["nodes"]]
+
+    cluster_boxes = "".join(render_cluster_box(cluster) for cluster in clusters)
+    cluster_guides = "\n".join(render_cluster_guides(cluster) for cluster in clusters)
+    edge_svg = render_visible_edges(edge_descriptors)
+    node_labels = render_node_frame_labels(all_nodes, positions)
+    node_svg = render_nodes(all_nodes, positions)
+    walker_data = build_walker_payload(all_nodes, positions, edge_descriptors, fps=fps)
+    visible_transition_count = sum(
+        len(cluster["bridge_transitions"]) for cluster in clusters
+    ) + len(cross_action_transitions)
+
+    svg = f"""
+    <svg id="graph-svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">
+      {build_marker_defs()}
+      <g>{cluster_boxes}</g>
+      <g>{cluster_guides}</g>
+      <g>{edge_svg}</g>
+      <g>{node_labels}</g>
+      <g>{node_svg}</g>
+      <circle id="walker-ball" cx="-100" cy="-100" r="6.5" class="walker-ball"></circle>
+    </svg>
+    """
     summary = html.escape(
         (
-            f"actions={len(actions)}, directed action pairs={len(groups)}, "
-            f"rendered cross-action edges={len(group_items)}, "
-            f"individual transitions={sum(len(items) for items in groups.values())}"
+            f"actions={len(clusters)}, nodes={len(all_nodes)}, "
+            f"edges={len(edge_descriptors)}, transitions={visible_transition_count}, "
+            f"visible cross-action transitions={len(cross_action_transitions)}"
         )
     )
-
-    if not group_items:
-        empty_html = '<div class="summary">No cross-action transitions found.</div>'
-    else:
-        empty_html = ""
-    marker_defs = render_marker_defs()
-
-    return f"""
-    <section class="panel">
-      <h2>Cross-Action Transitions</h2>
-      <div class="summary">{summary}</div>
-      {empty_html}
-      <div class="canvas">
-        <svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg">
-          {marker_defs}
-          <g>{''.join(path_parts)}</g>
-          <g>{''.join(label_parts)}</g>
-          <g>{''.join(node_parts)}</g>
-        </svg>
-      </div>
-    </section>
-    """
+    script_data = json.dumps(walker_data, ensure_ascii=True)
+    return svg, summary, script_data
 
 
 def render_html(
@@ -577,25 +817,14 @@ def render_html(
     frame_spacing: int,
     lane_spacing: int,
     max_transition_edges: int,
+    fps: float,
 ) -> str:
-    grouped_nodes = group_nodes_by_action(payload)
-    action_panels = [
-        render_action_panel(
-            action=action,
-            nodes=grouped_nodes[action],
-            payload=payload,
-            frame_spacing=frame_spacing,
-            lane_spacing=lane_spacing,
-        )
-        for action in sorted(grouped_nodes)
-    ]
-    cross_action_panel = render_cross_action_panel(payload, max_transition_edges)
-
-    summary = html.escape(
-        (
-            f"actions={len(grouped_nodes)}, nodes={payload.get('num_nodes', 0)}, "
-            f"edges={payload.get('num_edges', 0)}, transitions={payload.get('num_transitions', 0)}"
-        )
+    svg, summary, walker_data = render_svg(
+        payload,
+        frame_spacing=frame_spacing,
+        lane_spacing=lane_spacing,
+        max_transition_edges=max_transition_edges,
+        fps=fps,
     )
 
     return f"""<!DOCTYPE html>
@@ -615,7 +844,8 @@ def render_html(
       --cross: #9f3d56;
       --node: #1d5c63;
       --border: #cdbca8;
-      --box: #efe2d1;
+      --cluster: #f5ede2;
+      --walker: #f2b134;
     }}
     body {{
       margin: 0;
@@ -624,148 +854,286 @@ def render_html(
       background: linear-gradient(180deg, #f3eadf 0%, var(--bg) 100%);
     }}
     .page {{
-      max-width: 1480px;
+      max-width: 1440px;
       margin: 0 auto;
-      padding: 24px;
+      padding: 18px;
     }}
-    .hero {{
-      margin-bottom: 18px;
-    }}
-    .hero h1 {{
-      margin: 0 0 6px 0;
-      font-size: 30px;
+    h1 {{
+      margin: 0 0 4px 0;
+      font-size: 28px;
       font-weight: 600;
     }}
     .summary {{
       color: var(--muted);
-      font-size: 14px;
+      font-size: 13px;
     }}
     .legend {{
       display: flex;
-      gap: 18px;
+      gap: 14px;
       flex-wrap: wrap;
-      margin-top: 14px;
-      font-size: 14px;
+      margin-top: 10px;
+      margin-bottom: 10px;
+      font-size: 13px;
     }}
-    .legend-item {{
+    .controls {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+      font-size: 13px;
+      color: var(--muted);
+    }}
+    .controls label {{
       display: inline-flex;
       align-items: center;
       gap: 8px;
     }}
+    .controls input[type="range"] {{
+      width: 220px;
+    }}
+    .controls input[type="number"] {{
+      width: 76px;
+      padding: 4px 6px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fffdfa;
+      color: var(--ink);
+      font: inherit;
+    }}
+    .controls .readout {{
+      color: var(--ink);
+      font-variant-numeric: tabular-nums;
+    }}
+    .legend-item {{
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+    }}
     .swatch {{
-      width: 22px;
+      width: 18px;
       height: 0;
       border-top: 3px solid currentColor;
     }}
     .dot {{
-      width: 10px;
-      height: 10px;
+      width: 9px;
+      height: 9px;
       border-radius: 999px;
       background: currentColor;
       display: inline-block;
     }}
-    .grid {{
-      display: grid;
-      gap: 18px;
-    }}
-    .panel {{
-      background: var(--panel);
+    .canvas {{
       border: 1px solid var(--border);
       border-radius: 16px;
-      padding: 18px 20px;
-      box-shadow: 0 10px 26px rgba(65, 45, 22, 0.08);
-    }}
-    .panel h2 {{
-      margin: 0 0 6px 0;
-      font-size: 22px;
-      font-weight: 600;
-    }}
-    .canvas {{
-      overflow: auto;
-      border: 1px solid var(--border);
-      border-radius: 12px;
       background: #fffdfa;
-      margin-top: 14px;
+      box-shadow: 0 10px 26px rgba(65, 45, 22, 0.08);
+      padding: 6px;
     }}
     svg {{
       display: block;
-      min-width: 100%;
+      width: 100%;
+      height: auto;
+    }}
+    .cluster-box {{
+      fill: var(--cluster);
+      stroke: var(--border);
+      stroke-width: 1.2;
+    }}
+    .cluster-title {{
+      fill: var(--ink);
+      font-size: 18px;
+      font-weight: 600;
+    }}
+    .cluster-summary {{
+      fill: var(--muted);
+      font-size: 10px;
     }}
     .lane-label {{
-      font-size: 13px;
+      font-size: 11px;
       fill: var(--ink);
-    }}
-    .frame-label {{
-      font-size: 12px;
-      text-anchor: middle;
-      fill: var(--muted);
     }}
     .lane-guide {{
       stroke: var(--guide);
       stroke-width: 1;
     }}
-    .frame-guide {{
-      stroke: #efe7db;
-      stroke-width: 1;
-    }}
     .sequence-edge {{
+      fill: none;
       stroke: var(--sequence);
-      stroke-width: 2;
-      opacity: 0.78;
+      stroke-width: 1.9;
+      opacity: 0.8;
     }}
     .intra-transition-edge {{
       fill: none;
       stroke: var(--intra);
-      stroke-width: 2.3;
-      opacity: 0.7;
+      stroke-width: 2.1;
+      opacity: 0.72;
     }}
     .cross-transition-edge {{
       fill: none;
       stroke: var(--cross);
-      stroke-width: 2.5;
-      opacity: 0.72;
+      stroke-width: 1.9;
+      opacity: 0.48;
     }}
     .node {{
       fill: var(--node);
       stroke: #fff;
-      stroke-width: 1.2;
+      stroke-width: 1.1;
     }}
-    .action-box {{
-      fill: var(--box);
-      stroke: var(--border);
-      stroke-width: 1.4;
-    }}
-    .action-box-label {{
-      fill: var(--ink);
-      font-size: 14px;
+    .node-frame-label {{
+      fill: var(--muted);
+      font-size: 9px;
       text-anchor: middle;
-      font-weight: 600;
     }}
-    .cross-label {{
-      fill: var(--cross);
-      font-size: 12px;
-      text-anchor: middle;
+    .walker-ball {{
+      fill: var(--walker);
+      stroke: #fff8e1;
+      stroke-width: 1.6;
+      filter: drop-shadow(0 0 5px rgba(242, 177, 52, 0.6));
     }}
   </style>
 </head>
 <body>
   <div class="page">
-    <section class="hero">
-      <h1>Motion Graph</h1>
-      <div class="summary">{summary}</div>
-      <div class="legend">
-        <span class="legend-item" style="color: var(--sequence);"><span class="swatch"></span>Sequence path inside one animation</span>
-        <span class="legend-item" style="color: var(--intra);"><span class="swatch"></span>Minimal intra-action bridge transition</span>
-        <span class="legend-item" style="color: var(--cross);"><span class="swatch"></span>Cross-action transition summary</span>
-        <span class="legend-item">Arrowheads indicate direction</span>
-        <span class="legend-item" style="color: var(--node);"><span class="dot"></span>Frame node</span>
-      </div>
-    </section>
-    <div class="grid">
-      {''.join(action_panels)}
-      {cross_action_panel}
+    <h1>Motion Graph</h1>
+    <div class="summary">{summary}</div>
+    <div class="legend">
+      <span class="legend-item" style="color: var(--sequence);"><span class="swatch"></span>Sequence edge</span>
+      <span class="legend-item" style="color: var(--intra);"><span class="swatch"></span>Intra-action bridge</span>
+      <span class="legend-item" style="color: var(--cross);"><span class="swatch"></span>Cross-action transition</span>
+      <span class="legend-item" style="color: var(--node);"><span class="dot"></span>Transition node</span>
+      <span class="legend-item" style="color: var(--walker);"><span class="dot"></span>Random walker</span>
+    </div>
+    <div class="controls">
+      <label for="walker-fps-slider">Walker FPS
+        <input id="walker-fps-slider" type="range" min="1" max="120" step="1" value="{int(round(fps))}">
+      </label>
+      <label for="walker-fps-input">Exact FPS
+        <input id="walker-fps-input" type="number" min="1" max="240" step="1" value="{int(round(fps))}">
+      </label>
+      <span id="walker-fps-readout" class="readout"></span>
+    </div>
+    <div class="canvas">
+      {svg}
     </div>
   </div>
+  <script>
+    const walkerData = {walker_data};
+    const walkerBall = document.getElementById("walker-ball");
+    const edgeIds = Object.keys(walkerData.edges);
+    const nodesWithOutgoing = Object.keys(walkerData.outgoing);
+    const fpsSlider = document.getElementById("walker-fps-slider");
+    const fpsInput = document.getElementById("walker-fps-input");
+    const fpsReadout = document.getElementById("walker-fps-readout");
+
+    if (walkerBall && edgeIds.length > 0 && nodesWithOutgoing.length > 0) {{
+      let walkerFps = Math.max(Number(walkerData.fps) || 30, 1);
+      let currentEdgeId = null;
+      let currentPath = null;
+      let edgeLength = 0;
+      let edgeDuration = 1000 / walkerFps;
+      let edgeStartTime = null;
+
+      function frameDurationMs() {{
+        return 1000 / walkerFps;
+      }}
+
+      function syncFpsControls() {{
+        const rounded = Math.max(1, Math.round(walkerFps));
+        if (fpsSlider) {{
+          fpsSlider.value = String(rounded);
+        }}
+        if (fpsInput) {{
+          fpsInput.value = String(rounded);
+        }}
+        if (fpsReadout) {{
+          fpsReadout.textContent = `${{rounded}} fps`;
+        }}
+      }}
+
+      function logicalEdgeDurationMs(edgeId) {{
+        const edgeData = walkerData.edges[edgeId] || {{}};
+        const logicalEdgeLength = Math.max(Number(edgeData.length) || 0, 1);
+        return logicalEdgeLength * frameDurationMs();
+      }}
+
+      function setWalkerFps(value) {{
+        const nextFps = Math.max(Number(value) || walkerFps || 30, 1);
+        const now = performance.now();
+        if (currentEdgeId && edgeStartTime !== null) {{
+          const previousDuration = Math.max(edgeDuration, 1);
+          const progress = Math.min((now - edgeStartTime) / previousDuration, 1);
+          walkerFps = nextFps;
+          edgeDuration = logicalEdgeDurationMs(currentEdgeId);
+          edgeStartTime = now - progress * edgeDuration;
+        }} else {{
+          walkerFps = nextFps;
+          edgeDuration = frameDurationMs();
+        }}
+        walkerData.fps = walkerFps;
+        syncFpsControls();
+      }}
+
+      function pickRandom(list) {{
+        return list[Math.floor(Math.random() * list.length)];
+      }}
+
+      function chooseNextEdge(fromNodeId) {{
+        const outgoing = walkerData.outgoing[fromNodeId];
+        if (outgoing && outgoing.length > 0) {{
+          return pickRandom(outgoing);
+        }}
+        return pickRandom(walkerData.outgoing[pickRandom(nodesWithOutgoing)]);
+      }}
+
+      function activateEdge(edgeId, timestamp) {{
+        currentEdgeId = edgeId;
+        currentPath = document.getElementById(edgeId);
+        if (!currentPath) {{
+          currentEdgeId = null;
+          return;
+        }}
+        edgeLength = Math.max(currentPath.getTotalLength(), 1);
+        edgeDuration = logicalEdgeDurationMs(edgeId);
+        edgeStartTime = timestamp;
+      }}
+
+      function step(timestamp) {{
+        if (!currentEdgeId) {{
+          activateEdge(pickRandom(edgeIds), timestamp);
+        }}
+        if (!currentPath) {{
+          requestAnimationFrame(step);
+          return;
+        }}
+
+        const progress = Math.min((timestamp - edgeStartTime) / edgeDuration, 1);
+        const point = currentPath.getPointAtLength(progress * edgeLength);
+        walkerBall.setAttribute("cx", point.x.toFixed(2));
+        walkerBall.setAttribute("cy", point.y.toFixed(2));
+
+        if (progress >= 1) {{
+          const edge = walkerData.edges[currentEdgeId];
+          activateEdge(chooseNextEdge(edge.target), timestamp);
+        }}
+
+        requestAnimationFrame(step);
+      }}
+
+      if (fpsSlider) {{
+        fpsSlider.addEventListener("input", (event) => {{
+          setWalkerFps(event.target.value);
+        }});
+      }}
+      if (fpsInput) {{
+        fpsInput.addEventListener("input", (event) => {{
+          setWalkerFps(event.target.value);
+        }});
+      }}
+
+      syncFpsControls();
+      requestAnimationFrame(step);
+    }}
+  </script>
 </body>
 </html>
 """
@@ -774,15 +1142,18 @@ def render_html(
 def save_motion_graph_visualization(
     payload: Dict[str, Any],
     output_path: Path,
-    frame_spacing: int = 36,
-    lane_spacing: int = 110,
+    frame_spacing: int = 58,
+    lane_spacing: int = 72,
     max_transition_edges: int = 0,
+    fps: float = 30.0,
 ) -> Path:
+    payload = normalize_motion_graph_payload(dict(payload))
     html_text = render_html(
         payload=payload,
         frame_spacing=frame_spacing,
         lane_spacing=lane_spacing,
         max_transition_edges=max_transition_edges,
+        fps=fps,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_text, encoding="utf-8")
@@ -791,13 +1162,16 @@ def save_motion_graph_visualization(
 
 def main() -> None:
     args = build_parser().parse_args()
-    payload = load_motion_graph(Path(args.motion_graph))
+    payload = normalize_motion_graph_payload(
+        load_motion_graph(Path(args.motion_graph))
+    )
     output_path = save_motion_graph_visualization(
         payload=payload,
         output_path=Path(args.output),
         frame_spacing=args.frame_spacing,
         lane_spacing=args.lane_spacing,
         max_transition_edges=args.max_transition_edges,
+        fps=args.fps,
     )
     print(f"Saved motion graph visualization to {output_path}")
 

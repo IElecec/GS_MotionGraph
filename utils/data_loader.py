@@ -1,10 +1,29 @@
 from pathlib import Path
+import re
 from typing import Dict, List, Iterator, Optional
 
-def natural_frame_key(path: Path) -> int:
-    # frame_0.ply -> 0
+
+def natural_frame_key(path: Path) -> tuple[int, str]:
+    # Supports names like:
+    # - frame_0.ply
+    # - point_cloud_1.ply
+    # - point_cloud1.ply
     stem = path.stem
-    return int(stem.split("_")[-1])
+    match = re.search(r"(\d+)$", stem)
+    if match is None:
+        return (10**12, stem)
+    return (int(match.group(1)), stem)
+
+
+def collect_frame_files(directory: Path) -> List[Path]:
+    return sorted(
+        (
+            path
+            for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() == ".ply"
+        ),
+        key=natural_frame_key,
+    )
 
 
 class Database:
@@ -36,14 +55,15 @@ class Database:
             action_name = action_dir.name
             animations: Dict[str, List[Path]] = {}
 
+            direct_frames = collect_frame_files(action_dir)
+            if direct_frames:
+                animations["default"] = direct_frames
+
             for anim_dir in sorted(action_dir.iterdir()):
                 if not anim_dir.is_dir():
                     continue
 
-                frames = sorted(
-                    anim_dir.glob("frame_*.ply"),
-                    key=natural_frame_key,
-                )
+                frames = collect_frame_files(anim_dir)
 
                 if frames:
                     animations[anim_dir.name] = frames

@@ -1,4 +1,5 @@
 data/
 __pycache__/
-output/
+outputs/
 .vscode/
+generate_sample_char1.py

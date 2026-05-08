@@ -56,27 +56,25 @@ def main() -> None:
     from motion_graph import MotionGraph
     from utils import Database
 
-    database = Database(Path(args.database))
-    motion_graph = MotionGraph.build(
-        database=database,
+    db = Database(Path(args.database))
+    graph = MotionGraph.build(
+        database=db,
         similarity_dir=Path(args.similarity_dir),
         distance_threshold=args.distance_threshold,
         top_k=args.top_k,
         prune_dead_ends=not args.keep_dead_ends,
     )
-    output_path = motion_graph.save(Path(args.output))
-    shortest_path_output = None
+    output_path = graph.save(Path(args.output))
+    shortest_path_path = None
     if args.shortest_path:
-        shortest_path_output = motion_graph.save_shortest_paths_to_all_other_actions(
-            output_path=output_path.parent,
-        )
+        shortest_path_path = graph.save_shortest_paths(output_path.parent)
 
     print(
-        f"Saved motion graph with {len(motion_graph.nodes)} nodes and "
-        f"{len(motion_graph.edges)} edges to {output_path}"
+        f"Saved motion graph with {len(graph.nodes)} nodes and "
+        f"{len(graph.edges)} edges to {output_path}"
     )
-    if shortest_path_output is not None:
-        print(f"Saved shortest path data at {shortest_path_output}")
+    if shortest_path_path is not None:
+        print(f"Saved shortest path data at {shortest_path_path}")
 
 
 if __name__ == "__main__":

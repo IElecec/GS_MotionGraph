@@ -2,7 +2,7 @@ import argparse
 import html
 import json
 import math
-import os
+import socket
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -44,7 +44,7 @@ class UnionFind:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Render motion_graph.json as a standalone HTML visualization."
+        description="Serve motion_graph.json through a Flask-based web visualization."
     )
     parser.add_argument(
         "-g",
@@ -55,8 +55,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "-o",
         "--output",
-        required=True,
-        help="output HTML path",
+        default=None,
+        help="deprecated compatibility flag; static HTML export was removed and this value is ignored",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="host bind address for the Flask visualization server",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="port for the Flask visualization server",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("graph", "image"),
+        default="graph",
+        help="visualization mode: `graph` shows traversal only, `image` also shows rendered image preview",
     )
     parser.add_argument(
         "--frame-spacing",
@@ -85,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--image-manifest",
         default=None,
-        help="optional manifest.json produced by render_image_library.py; enables image playback in the HTML view",
+        help="optional manifest.json produced by render_image_library.py; enables image playback in the web view",
     )
     return parser
 
@@ -93,6 +110,43 @@ def build_parser() -> argparse.ArgumentParser:
 def load_motion_graph(path: Path) -> Dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def load_shortest_path_payload(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def port_bind_error(host: str, port: int) -> Optional[OSError]:
+    family = socket.AF_INET6 if ":" in host and host != "0.0.0.0" else socket.AF_INET
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        sock.bind((host, port))
+    except OSError as exc:
+        return exc
+    finally:
+        sock.close()
+    return None
+
+
+def suggest_available_ports(host: str, requested_port: int, limit: int = 3) -> List[int]:
+    suggestions: List[int] = []
+
+    if requested_port > 0:
+        for candidate in range(requested_port + 1, requested_port + 33):
+            if port_bind_error(host, candidate) is None:
+                suggestions.append(candidate)
+                if len(suggestions) >= limit:
+                    return suggestions
+
+    for candidate in (5000, 5001, 7000, 8080, 8765, 9000):
+        if candidate == requested_port or candidate in suggestions:
+            continue
+        if port_bind_error(host, candidate) is None:
+            suggestions.append(candidate)
+            if len(suggestions) >= limit:
+                break
+    return suggestions
 
 
 def lane_key(node: Dict[str, Any]) -> LaneKey:
@@ -105,6 +159,19 @@ def node_key(node: Dict[str, Any]) -> NodeKey:
 
 def node_id(node: Dict[str, Any]) -> str:
     return f"{node['action']}|{node['animation']}|{int(node['frame'])}"
+
+
+def edge_lookup_key(item: Dict[str, Any]) -> str:
+    return "|".join(
+        [
+            node_id(item["source"]),
+            node_id(item["target"]),
+            str(item.get("kind", "sequence")),
+            str(int(item.get("length", 0))),
+            f"{float(item.get('distance', 0.0)):.12g}",
+            f"{float(item.get('theta', 0.0)):.12g}",
+        ]
+    )
 
 
 def transition_edge_length(payload: Dict[str, Any]) -> int:
@@ -399,6 +466,7 @@ def build_action_clusters(
     frame_spacing: int,
     lane_spacing: int,
     max_transition_edges: int,
+    include_all_nodes: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[NodeKey, Tuple[float, float]], int, int, List[Dict[str, Any]]]:
     grouped_nodes = group_nodes_by_action(payload)
     action_names = sorted(grouped_nodes)
@@ -432,15 +500,18 @@ def build_action_clusters(
         if node_key(edge["source"]) in visible_transition_keys
         and node_key(edge["target"]) in visible_transition_keys
     ]
-    if not visible_transition_keys:
+    if not include_all_nodes and not visible_transition_keys:
         return [], {}, 56, 56, []
 
     for action in action_names:
-        nodes = [
-            node
-            for node in grouped_nodes[action]
-            if node_key(node) in visible_transition_keys
-        ]
+        if include_all_nodes:
+            nodes = list(grouped_nodes[action])
+        else:
+            nodes = [
+                node
+                for node in grouped_nodes[action]
+                if node_key(node) in visible_transition_keys
+            ]
         if not nodes:
             continue
 
@@ -752,13 +823,61 @@ def build_visible_edges(
     return edge_descriptors
 
 
-def render_visible_edges(edge_descriptors: List[Dict[str, Any]]) -> str:
+def build_helper_graph_edges(
+    payload: Dict[str, Any],
+    positions: Dict[NodeKey, Tuple[float, float]],
+) -> List[Dict[str, Any]]:
+    edge_descriptors: List[Dict[str, Any]] = []
+    for edge_idx, item in enumerate(payload.get("edges", [])):
+        source = node_key(item["source"])
+        target = node_key(item["target"])
+        if source not in positions or target not in positions:
+            continue
+
+        edge_id = f"walker_helper_edge_{edge_idx}"
+        if item.get("kind") == "sequence":
+            descriptor = build_line_edge_descriptor(
+                edge_id=edge_id,
+                item=item,
+                positions=positions,
+                css_class="walker-helper-edge",
+                marker_id="",
+                kind_label="sequence",
+            )
+        elif item["source"]["action"] == item["target"]["action"]:
+            descriptor = build_internal_transition_descriptor(
+                edge_id=edge_id,
+                item=item,
+                positions=positions,
+                css_class="walker-helper-edge",
+                marker_id="",
+            )
+        else:
+            descriptor = build_cross_transition_descriptor(
+                edge_id=edge_id,
+                item=item,
+                positions=positions,
+                css_class="walker-helper-edge",
+                marker_id="",
+            )
+        descriptor["lookup_key"] = edge_lookup_key(item)
+        descriptor["helper"] = True
+        edge_descriptors.append(descriptor)
+    return edge_descriptors
+
+
+def render_edge_paths(edge_descriptors: List[Dict[str, Any]]) -> str:
     parts: List[str] = []
     for edge in edge_descriptors:
+        marker_attr = (
+            f' marker-end="url(#{edge["marker_id"]})"'
+            if edge.get("marker_id")
+            else ""
+        )
         parts.append(
             (
                 f'<path id="{edge["id"]}" d="{edge["path_d"]}" class="{edge["css_class"]}" '
-                f'marker-end="url(#{edge["marker_id"]})"><title>{edge["tooltip"]}</title></path>'
+                f'{marker_attr}><title>{edge["tooltip"]}</title></path>'
             )
         )
     return "\n".join(parts)
@@ -773,41 +892,88 @@ def load_image_manifest(path: Path) -> Dict[str, Any]:
         return json.load(handle)
 
 
-def make_html_relative_path(target_path: Path, html_output_path: Path) -> str:
-    relative = os.path.relpath(target_path, html_output_path.parent)
-    return Path(relative).as_posix()
+def register_asset_url(
+    asset_files: Dict[str, Path],
+    asset_ids_by_path: Dict[str, str],
+    target_path: Path,
+) -> Optional[str]:
+    resolved_path = target_path.resolve()
+    if not resolved_path.exists():
+        return None
+
+    asset_key = str(resolved_path)
+    asset_id = asset_ids_by_path.get(asset_key)
+    if asset_id is None:
+        asset_id = f"asset_{len(asset_files):06d}"
+        asset_ids_by_path[asset_key] = asset_id
+        asset_files[asset_id] = resolved_path
+    return f"/assets/{asset_id}"
 
 
 def resolve_image_manifest_assets(
-    output_path: Path,
+    motion_graph_path: Path,
     image_manifest_path: Optional[Path],
+    required: bool = False,
 ) -> Optional[Dict[str, Any]]:
     if image_manifest_path is None:
-        default_manifest = output_path.parent / "rendered_images" / "manifest.json"
+        default_manifest = motion_graph_path.parent / "rendered_images" / "manifest.json"
         if default_manifest.exists():
             image_manifest_path = default_manifest
         else:
+            if required:
+                raise FileNotFoundError(
+                    "Image mode requires a rendered image manifest. "
+                    "Pass --image-manifest or place rendered_images/manifest.json next to motion_graph.json."
+                )
             return None
 
     if not image_manifest_path.exists():
         raise FileNotFoundError(f"Image manifest not found: {image_manifest_path}")
 
     raw_manifest = load_image_manifest(image_manifest_path)
-    normal_frames = {
-        key: make_html_relative_path((image_manifest_path.parent / rel_path).resolve(), output_path)
-        for key, rel_path in raw_manifest.get("normal_frames", {}).items()
-    }
-    transition_frames = {
-        folder: [
-            make_html_relative_path((image_manifest_path.parent / rel_path).resolve(), output_path)
-            for rel_path in rel_paths
-        ]
-        for folder, rel_paths in raw_manifest.get("transition_frames", {}).items()
-    }
+    asset_files: Dict[str, Path] = {}
+    asset_ids_by_path: Dict[str, str] = {}
+    normal_frames: Dict[str, str] = {}
+
+    for key, rel_path in raw_manifest.get("normal_frames", {}).items():
+        asset_url = register_asset_url(
+            asset_files,
+            asset_ids_by_path,
+            image_manifest_path.parent / rel_path,
+        )
+        if asset_url is not None:
+            normal_frames[key] = asset_url
+
+    transition_frames: Dict[str, List[str]] = {}
+    for folder, rel_paths in raw_manifest.get("transition_frames", {}).items():
+        urls: List[str] = []
+        for rel_path in rel_paths:
+            asset_url = register_asset_url(
+                asset_files,
+                asset_ids_by_path,
+                image_manifest_path.parent / rel_path,
+            )
+            if asset_url is not None:
+                urls.append(asset_url)
+        transition_frames[folder] = urls
+
     return {
         "manifest_path": str(image_manifest_path),
         "normal_frames": normal_frames,
         "transition_frames": transition_frames,
+        "asset_files": asset_files,
+    }
+
+
+def resolve_shortest_path_assets(
+    motion_graph_path: Path,
+) -> Optional[Dict[str, Any]]:
+    shortest_path_path = motion_graph_path.parent / "shortest_path.json"
+    if not shortest_path_path.exists():
+        return None
+    return {
+        "path": str(shortest_path_path),
+        "payload": load_shortest_path_payload(shortest_path_path),
     }
 
 
@@ -884,17 +1050,82 @@ def build_edge_payload(
             "transition_index": edge.get("transition_index"),
             "transition_folder": edge.get("transition_folder"),
             "image_paths": image_paths,
+            "helper": bool(edge.get("helper", False)),
             "label": f"{edge['source_id']} -> {edge['target_id']}",
         }
     return payload
 
 
+def build_outgoing_payload(edge_descriptors: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+    outgoing: Dict[str, List[str]] = {}
+    for edge in edge_descriptors:
+        outgoing.setdefault(edge["source_id"], []).append(edge["id"])
+    return outgoing
+
+
+def build_shortest_path_navigation_payload(
+    shortest_path_assets: Optional[Dict[str, Any]],
+    helper_edge_descriptors: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    if shortest_path_assets is None:
+        return None
+
+    helper_edge_lookup = {
+        edge["lookup_key"]: edge["id"]
+        for edge in helper_edge_descriptors
+        if "lookup_key" in edge
+    }
+    payload = shortest_path_assets["payload"]
+    source_routes: Dict[str, Dict[str, Any]] = {}
+
+    for source_node in payload.get("source_nodes", []):
+        source_id = str(source_node.get("source_id", ""))
+        if not source_id:
+            continue
+
+        target_routes: Dict[str, Any] = {}
+        for route in source_node.get("paths_to_other_actions", []):
+            target_action = str(route.get("target_action", ""))
+            if not target_action:
+                continue
+
+            edge_ids: List[str] = []
+            route_available = bool(route.get("reachable", False))
+            for edge in route.get("edges", []):
+                edge_id = helper_edge_lookup.get(edge_lookup_key(edge))
+                if edge_id is None:
+                    route_available = False
+                    edge_ids = []
+                    break
+                edge_ids.append(edge_id)
+
+            target_routes[target_action] = {
+                "reachable": route_available,
+                "target_id": route.get("target_id"),
+                "total_cost": float(route.get("total_cost", 0.0)),
+                "total_frames": int(route.get("total_frames", 0)),
+                "total_transition_distance": float(route.get("total_transition_distance", 0.0)),
+                "num_transitions": int(route.get("num_transitions", 0)),
+                "num_edges": int(route.get("num_edges", len(edge_ids))),
+                "edge_ids": edge_ids,
+            }
+        source_routes[source_id] = target_routes
+
+    return {
+        "available_actions": list(payload.get("available_actions", [])),
+        "source_routes": source_routes,
+        "path": shortest_path_assets.get("path"),
+    }
+
+
 def build_walker_payload(
     nodes: List[Dict[str, Any]],
     positions: Dict[NodeKey, Tuple[float, float]],
-    edge_descriptors: List[Dict[str, Any]],
+    random_edge_descriptors: List[Dict[str, Any]],
+    helper_edge_descriptors: List[Dict[str, Any]],
     fps: float,
     image_assets: Optional[Dict[str, Any]],
+    shortest_path_assets: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:
     node_positions = {
         node_id(node): [round(positions[node_key(node)][0], 3), round(positions[node_key(node)][1], 3)]
@@ -917,16 +1148,21 @@ def build_walker_payload(
             "image_path": image_path,
         }
 
-    outgoing: Dict[str, List[str]] = {}
-    for edge in edge_descriptors:
-        outgoing.setdefault(edge["source_id"], []).append(edge["id"])
+    all_edge_descriptors = list(random_edge_descriptors) + list(helper_edge_descriptors)
+    random_outgoing = build_outgoing_payload(random_edge_descriptors)
     return {
         "fps": float(fps),
         "has_images": image_assets is not None,
         "nodes": node_positions,
         "node_info": node_info,
-        "outgoing": outgoing,
-        "edges": build_edge_payload(edge_descriptors, image_assets),
+        "outgoing": random_outgoing,
+        "random_edge_ids": [edge["id"] for edge in random_edge_descriptors],
+        "random_outgoing": random_outgoing,
+        "edges": build_edge_payload(all_edge_descriptors, image_assets),
+        "shortest_paths": build_shortest_path_navigation_payload(
+            shortest_path_assets,
+            helper_edge_descriptors,
+        ),
     }
 
 
@@ -937,31 +1173,41 @@ def render_svg(
     max_transition_edges: int,
     fps: float,
     image_assets: Optional[Dict[str, Any]],
+    shortest_path_assets: Optional[Dict[str, Any]],
 ) -> Tuple[str, str, str]:
     clusters, positions, width, height, cross_action_transitions = build_action_clusters(
         payload,
         frame_spacing,
         lane_spacing,
         max_transition_edges,
+        include_all_nodes=shortest_path_assets is not None,
     )
-    edge_descriptors = build_visible_edges(
+    visible_edge_descriptors = build_visible_edges(
         clusters,
         positions,
         cross_action_transitions,
+    )
+    helper_edge_descriptors = (
+        build_helper_graph_edges(payload, positions)
+        if shortest_path_assets is not None
+        else []
     )
     all_nodes = [node for cluster in clusters for node in cluster["nodes"]]
 
     cluster_boxes = "".join(render_cluster_box(cluster) for cluster in clusters)
     cluster_guides = "\n".join(render_cluster_guides(cluster) for cluster in clusters)
-    edge_svg = render_visible_edges(edge_descriptors)
+    helper_edge_svg = render_edge_paths(helper_edge_descriptors)
+    edge_svg = render_edge_paths(visible_edge_descriptors)
     node_labels = render_node_frame_labels(all_nodes, positions)
     node_svg = render_nodes(all_nodes, positions)
     walker_data = build_walker_payload(
         all_nodes,
         positions,
-        edge_descriptors,
+        visible_edge_descriptors,
+        helper_edge_descriptors,
         fps=fps,
         image_assets=image_assets,
+        shortest_path_assets=shortest_path_assets,
     )
     visible_transition_count = sum(
         len(cluster["bridge_transitions"]) for cluster in clusters
@@ -972,6 +1218,7 @@ def render_svg(
       {build_marker_defs()}
       <g>{cluster_boxes}</g>
       <g>{cluster_guides}</g>
+      <g>{helper_edge_svg}</g>
       <g>{edge_svg}</g>
       <g>{node_labels}</g>
       <g>{node_svg}</g>
@@ -981,7 +1228,7 @@ def render_svg(
     summary = html.escape(
         (
             f"actions={len(clusters)}, nodes={len(all_nodes)}, "
-            f"edges={len(edge_descriptors)}, transitions={visible_transition_count}, "
+            f"edges={len(visible_edge_descriptors)}, transitions={visible_transition_count}, "
             f"visible cross-action transitions={len(cross_action_transitions)}"
         )
     )
@@ -996,6 +1243,8 @@ def render_html(
     max_transition_edges: int,
     fps: float,
     image_assets: Optional[Dict[str, Any]],
+    shortest_path_assets: Optional[Dict[str, Any]],
+    view_mode: str,
 ) -> str:
     svg, summary, walker_data = render_svg(
         payload,
@@ -1004,6 +1253,23 @@ def render_html(
         max_transition_edges=max_transition_edges,
         fps=fps,
         image_assets=image_assets,
+        shortest_path_assets=shortest_path_assets,
+    )
+    show_image_preview = view_mode == "image"
+    content_grid_class = "content-grid" if show_image_preview else "content-grid graph-mode"
+    preview_panel_class = "preview-panel" if show_image_preview else "preview-panel preview-panel-compact"
+    preview_block = (
+        """
+        <div class="preview-title">Walker Preview</div>
+        <img id="walker-preview-image" class="preview-frame" alt="Walker frame preview" hidden>
+        <div id="walker-preview-empty" class="preview-empty">Render an image library and pass `--image-manifest` to show frame playback here.</div>
+        <div id="walker-preview-caption" class="preview-caption"></div>
+        """
+        if show_image_preview
+        else """
+        <div class="preview-title">Graph Traversal</div>
+        <div class="preview-mode-note">Graph mode is active. The walker follows graph edges without rendered frame preview.</div>
+        """
     )
 
     return f"""<!DOCTYPE html>
@@ -1033,7 +1299,7 @@ def render_html(
       background: linear-gradient(180deg, #f3eadf 0%, var(--bg) 100%);
     }}
     .page {{
-      max-width: 1440px;
+      max-width: 1680px;
       margin: 0 auto;
       padding: 18px;
     }}
@@ -1103,25 +1369,43 @@ def render_html(
     }}
     .content-grid {{
       display: grid;
-      grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
-      gap: 16px;
+      grid-template-columns: minmax(420px, 560px) minmax(0, 1fr);
+      gap: 20px;
       align-items: start;
+    }}
+    .content-grid.graph-mode {{
+      grid-template-columns: minmax(280px, 340px) minmax(0, 1fr);
     }}
     .preview-panel {{
       border: 1px solid var(--border);
       border-radius: 16px;
       background: #fffdfa;
       box-shadow: 0 10px 26px rgba(65, 45, 22, 0.08);
-      padding: 10px;
+      padding: 14px;
+      position: sticky;
+      top: 18px;
+    }}
+    .preview-panel.preview-panel-compact {{
+      padding-bottom: 12px;
     }}
     .preview-title {{
       font-size: 15px;
       font-weight: 600;
       margin-bottom: 8px;
     }}
+    .preview-mode-note {{
+      border-radius: 12px;
+      border: 1px dashed var(--border);
+      padding: 14px;
+      color: var(--muted);
+      background: linear-gradient(180deg, #f3eadf 0%, #fffdfa 100%);
+      font-size: 12px;
+      line-height: 1.45;
+    }}
     .preview-frame {{
       width: 100%;
       aspect-ratio: 1 / 1;
+      min-height: clamp(420px, 52vh, 680px);
       object-fit: contain;
       border-radius: 12px;
       background: linear-gradient(180deg, #f3eadf 0%, #fffdfa 100%);
@@ -1131,6 +1415,7 @@ def render_html(
     .preview-empty {{
       width: 100%;
       aspect-ratio: 1 / 1;
+      min-height: clamp(420px, 52vh, 680px);
       border-radius: 12px;
       border: 1px dashed var(--border);
       display: flex;
@@ -1147,6 +1432,59 @@ def render_html(
       color: var(--muted);
       font-size: 12px;
       min-height: 18px;
+    }}
+    .route-panel {{
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+    }}
+    .route-toggle-row {{
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 10px;
+      flex-wrap: wrap;
+    }}
+    .route-title {{
+      font-size: 14px;
+      font-weight: 600;
+      margin-bottom: 0;
+    }}
+    .route-buttons {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .route-button {{
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: #fff7ec;
+      color: var(--ink);
+      padding: 7px 12px;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+    }}
+    .route-button:hover:not(:disabled) {{
+      background: #f6e6c9;
+      border-color: #c79f5b;
+    }}
+    .route-button.active {{
+      background: #f2b134;
+      border-color: #cf8f08;
+      color: #2d2108;
+    }}
+    .route-button:disabled {{
+      cursor: default;
+      opacity: 0.45;
+    }}
+    .route-status {{
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      min-height: 34px;
+      line-height: 1.4;
     }}
     .canvas {{
       border: 1px solid var(--border);
@@ -1200,6 +1538,21 @@ def render_html(
       stroke-width: 1.9;
       opacity: 0.48;
     }}
+    .walker-helper-edge {{
+      fill: none;
+      stroke: transparent;
+      stroke-width: 6;
+      opacity: 0;
+      pointer-events: none;
+    }}
+    .walker-helper-edge.guided-edge,
+    .sequence-edge.guided-edge,
+    .intra-transition-edge.guided-edge,
+    .cross-transition-edge.guided-edge {{
+      stroke: var(--walker);
+      stroke-width: 3.3;
+      opacity: 0.9;
+    }}
     .node {{
       fill: var(--node);
       stroke: #fff;
@@ -1219,6 +1572,9 @@ def render_html(
     @media (max-width: 1080px) {{
       .content-grid {{
         grid-template-columns: 1fr;
+      }}
+      .preview-panel {{
+        position: static;
       }}
     }}
   </style>
@@ -1243,12 +1599,17 @@ def render_html(
       </label>
       <span id="walker-fps-readout" class="readout"></span>
     </div>
-    <div class="content-grid">
-      <div class="preview-panel">
-        <div class="preview-title">Walker Preview</div>
-        <img id="walker-preview-image" class="preview-frame" alt="Walker frame preview" hidden>
-        <div id="walker-preview-empty" class="preview-empty">Render an image library and pass `--image-manifest` to show frame playback here.</div>
-        <div id="walker-preview-caption" class="preview-caption"></div>
+    <div class="{content_grid_class}">
+      <div class="{preview_panel_class}">
+        {preview_block}
+        <div class="route-panel">
+          <div class="route-toggle-row">
+            <div class="route-title">Navigate To Action</div>
+            <button id="walker-action-lock-button" type="button" class="route-button">Stay Within Current Action</button>
+          </div>
+          <div id="walker-route-buttons" class="route-buttons"></div>
+          <div id="walker-route-status" class="route-status"></div>
+        </div>
       </div>
       <div class="canvas">
         {svg}
@@ -1259,13 +1620,19 @@ def render_html(
     const walkerData = {walker_data};
     const walkerBall = document.getElementById("walker-ball");
     const edgeIds = Object.keys(walkerData.edges);
-    const nodesWithOutgoing = Object.keys(walkerData.outgoing);
+    const randomEdgeIds = walkerData.random_edge_ids || [];
+    const randomOutgoing = walkerData.random_outgoing || walkerData.outgoing || {{}};
+    const nodesWithOutgoing = Object.keys(randomOutgoing);
+    const shortestPathData = walkerData.shortest_paths || null;
     const fpsSlider = document.getElementById("walker-fps-slider");
     const fpsInput = document.getElementById("walker-fps-input");
     const fpsReadout = document.getElementById("walker-fps-readout");
     const previewImage = document.getElementById("walker-preview-image");
     const previewEmpty = document.getElementById("walker-preview-empty");
     const previewCaption = document.getElementById("walker-preview-caption");
+    const routeButtonsContainer = document.getElementById("walker-route-buttons");
+    const routeStatus = document.getElementById("walker-route-status");
+    const actionLockButton = document.getElementById("walker-action-lock-button");
 
     if (walkerBall && edgeIds.length > 0 && nodesWithOutgoing.length > 0) {{
       let walkerFps = Math.max(Number(walkerData.fps) || 30, 1);
@@ -1275,6 +1642,18 @@ def render_html(
       let edgeDuration = 1000 / walkerFps;
       let edgeStartTime = null;
       let lastPreviewPath = null;
+      let desiredPreviewPath = null;
+      let seededInitialEdgeId = null;
+      let activeHighlightedEdge = null;
+      let walkerMode = "random";
+      let queuedRouteEdgeIds = [];
+      let queuedRouteTargetAction = null;
+      let routeButtons = [];
+      let actionLockEnabled = false;
+      let lockedAction = null;
+      const randomEdgeIdsByAction = {{}};
+      const imageCache = new Map();
+      const preloadedEdgeIds = new Set();
 
       function frameDurationMs() {{
         return 1000 / walkerFps;
@@ -1339,6 +1718,95 @@ def render_html(
         return progress < 0.5 ? source.image_path : target.image_path;
       }}
 
+      function showPreviewImage(imagePath) {{
+        if (!previewImage || !previewEmpty) {{
+          return;
+        }}
+        if (imagePath !== lastPreviewPath) {{
+          previewImage.src = imagePath;
+          lastPreviewPath = imagePath;
+        }}
+        previewImage.hidden = false;
+        previewEmpty.hidden = true;
+      }}
+
+      function preloadImage(imagePath) {{
+        if (!imagePath) {{
+          return null;
+        }}
+
+        let record = imageCache.get(imagePath);
+        if (record) {{
+          return record;
+        }}
+
+        const img = new Image();
+        img.decoding = "async";
+        record = {{
+          image: img,
+          loaded: false,
+          error: false,
+        }};
+        img.onload = () => {{
+          record.loaded = true;
+          if (desiredPreviewPath === imagePath) {{
+            showPreviewImage(imagePath);
+          }}
+        }};
+        img.onerror = () => {{
+          record.error = true;
+        }};
+        img.src = imagePath;
+        imageCache.set(imagePath, record);
+        return record;
+      }}
+
+      function imagePathsForEdge(edgeId) {{
+        const edge = walkerData.edges[edgeId];
+        if (!edge) {{
+          return [];
+        }}
+
+        const paths = [];
+        const edgePaths = Array.isArray(edge.image_paths) ? edge.image_paths : [];
+        if (edgePaths.length > 0) {{
+          paths.push(...edgePaths);
+        }} else {{
+          const source = nodeInfoById(edge.source);
+          const target = nodeInfoById(edge.target);
+          if (source && source.image_path) {{
+            paths.push(source.image_path);
+          }}
+          if (target && target.image_path && target.image_path !== paths[paths.length - 1]) {{
+            paths.push(target.image_path);
+          }}
+        }}
+        return paths;
+      }}
+
+      function primeEdgeImages(edgeId) {{
+        if (!edgeId || preloadedEdgeIds.has(edgeId)) {{
+          return;
+        }}
+        preloadedEdgeIds.add(edgeId);
+        imagePathsForEdge(edgeId).forEach((imagePath) => {{
+          preloadImage(imagePath);
+        }});
+      }}
+
+      function primeOutgoingEdgeImages(nodeId, limit = 6) {{
+        const outgoing = randomOutgoing[nodeId] || [];
+        outgoing.slice(0, limit).forEach((edgeId) => {{
+          primeEdgeImages(edgeId);
+        }});
+      }}
+
+      function primeGuidedRouteImages(edgeIds, limit = 8) {{
+        (edgeIds || []).slice(0, limit).forEach((edgeId) => {{
+          primeEdgeImages(edgeId);
+        }});
+      }}
+
       function updatePreview(progress) {{
         const edge = walkerData.edges[currentEdgeId];
         const imagePath = imagePathAtCurrentPosition(progress);
@@ -1347,18 +1815,22 @@ def render_html(
         }}
 
         if (!imagePath) {{
+          desiredPreviewPath = null;
           previewImage.hidden = true;
           previewEmpty.hidden = false;
           previewCaption.textContent = edge ? edge.label || "" : "";
           return;
         }}
 
-        if (imagePath !== lastPreviewPath) {{
-          previewImage.src = imagePath;
-          lastPreviewPath = imagePath;
+        desiredPreviewPath = imagePath;
+        const record = preloadImage(imagePath);
+        if (record && record.loaded) {{
+          showPreviewImage(imagePath);
+        }} else if (!lastPreviewPath) {{
+          previewImage.hidden = true;
+          previewEmpty.hidden = false;
+          previewEmpty.textContent = "Loading frame preview...";
         }}
-        previewImage.hidden = false;
-        previewEmpty.hidden = true;
         previewCaption.textContent = edge ? edge.label || imagePath : imagePath;
       }}
 
@@ -1366,15 +1838,202 @@ def render_html(
         return list[Math.floor(Math.random() * list.length)];
       }}
 
-      function chooseNextEdge(fromNodeId) {{
-        const outgoing = walkerData.outgoing[fromNodeId];
+      function nodeInfoById(nodeId) {{
+        return nodeId ? (walkerData.node_info || {{}})[nodeId] || null : null;
+      }}
+
+      function actionAtNodeId(nodeId) {{
+        const info = nodeInfoById(nodeId);
+        return info ? info.action : null;
+      }}
+
+      function currentActionAnchorNodeId() {{
+        return currentRouteStartNodeId();
+      }}
+
+      function ensureRandomEdgeIdsForAction(action) {{
+        if (!action) {{
+          return [];
+        }}
+        if (randomEdgeIdsByAction[action]) {{
+          return randomEdgeIdsByAction[action];
+        }}
+        randomEdgeIdsByAction[action] = randomEdgeIds.filter((edgeId) => {{
+          const edge = walkerData.edges[edgeId];
+          return edge && actionAtNodeId(edge.source) === action && actionAtNodeId(edge.target) === action;
+        }});
+        return randomEdgeIdsByAction[action];
+      }}
+
+      function syncActionLockButton() {{
+        if (!actionLockButton) {{
+          return;
+        }}
+        actionLockButton.classList.toggle("active", actionLockEnabled);
+        if (actionLockEnabled && lockedAction) {{
+          actionLockButton.textContent = `Stay Within ${{lockedAction}}`;
+        }} else if (actionLockEnabled) {{
+          actionLockButton.textContent = "Stay Within Current Action";
+        }} else {{
+          actionLockButton.textContent = "Stay Within Current Action";
+        }}
+      }}
+
+      function chooseRandomEdge(fromNodeId) {{
+        if (actionLockEnabled && lockedAction) {{
+          const outgoing = (randomOutgoing[fromNodeId] || []).filter((edgeId) => {{
+            const edge = walkerData.edges[edgeId];
+            return edge && actionAtNodeId(edge.source) === lockedAction && actionAtNodeId(edge.target) === lockedAction;
+          }});
+          if (outgoing.length > 0) {{
+            return pickRandom(outgoing);
+          }}
+
+          const fallbackEdges = ensureRandomEdgeIdsForAction(lockedAction);
+          if (fallbackEdges.length > 0) {{
+            return pickRandom(fallbackEdges);
+          }}
+        }}
+
+        const outgoing = randomOutgoing[fromNodeId];
         if (outgoing && outgoing.length > 0) {{
           return pickRandom(outgoing);
         }}
-        return pickRandom(walkerData.outgoing[pickRandom(nodesWithOutgoing)]);
+        return pickRandom(randomOutgoing[pickRandom(nodesWithOutgoing)]);
+      }}
+
+      function setRouteStatus(text) {{
+        if (routeStatus) {{
+          routeStatus.textContent = text;
+        }}
+      }}
+
+      function currentRouteStartNodeId() {{
+        const edge = walkerData.edges[currentEdgeId];
+        return edge ? edge.target : null;
+      }}
+
+      function routeForCurrentPosition(targetAction) {{
+        if (!shortestPathData) {{
+          return null;
+        }}
+        const startNodeId = currentRouteStartNodeId();
+        if (!startNodeId) {{
+          return null;
+        }}
+        const startInfo = (walkerData.node_info || {{}})[startNodeId];
+        if (startInfo && startInfo.action === targetAction) {{
+          return {{
+            reachable: true,
+            target_id: startNodeId,
+            edge_ids: [],
+            total_cost: 0,
+            total_frames: 0,
+            total_transition_distance: 0,
+            num_transitions: 0,
+            num_edges: 0,
+          }};
+        }}
+        const sourceRoutes = (shortestPathData.source_routes || {{}})[startNodeId] || {{}};
+        return sourceRoutes[targetAction] || null;
+      }}
+
+      function refreshRouteButtons() {{
+        if (!shortestPathData || !routeButtons.length) {{
+          syncActionLockButton();
+          return;
+        }}
+        routeButtons.forEach((button) => {{
+          const targetAction = button.dataset.targetAction;
+          const route = routeForCurrentPosition(targetAction);
+          button.disabled = !route || !route.reachable;
+          button.classList.toggle(
+            "active",
+            walkerMode === "guided" && queuedRouteTargetAction === targetAction,
+          );
+        }});
+        syncActionLockButton();
+      }}
+
+      function buildRouteButtons() {{
+        if (!routeButtonsContainer || !routeStatus) {{
+          return;
+        }}
+        if (!shortestPathData || !(shortestPathData.available_actions || []).length) {{
+          routeButtonsContainer.innerHTML = "";
+          setRouteStatus("Generate `shortest_path.json` with `build_motion_graph.py --shortest-path` to enable action navigation.");
+          return;
+        }}
+
+        routeButtonsContainer.innerHTML = "";
+        routeButtons = [];
+        (shortestPathData.available_actions || []).forEach((action) => {{
+          const button = document.createElement("button");
+          button.type = "button";
+          button.className = "route-button";
+          button.dataset.targetAction = action;
+          button.textContent = `To ${{action}}`;
+          button.addEventListener("click", () => {{
+            const route = routeForCurrentPosition(action);
+            if (!route || !route.reachable) {{
+              setRouteStatus(`No shortest path is available from the current node to ${{action}}.`);
+              refreshRouteButtons();
+              return;
+            }}
+
+            walkerMode = "guided";
+            queuedRouteTargetAction = action;
+            queuedRouteEdgeIds = Array.isArray(route.edge_ids) ? [...route.edge_ids] : [];
+            if (queuedRouteEdgeIds.length > 0) {{
+              setRouteStatus(
+                `Following shortest path to ${{action}}: ${{route.total_frames}} frames, ${{route.num_transitions}} transition(s).`
+              );
+            }} else {{
+              setRouteStatus(`Current edge already reaches ${{action}}. Random walk will resume after arrival.`);
+            }}
+            primeGuidedRouteImages(queuedRouteEdgeIds);
+            setHighlightedEdge(currentEdgeId);
+            refreshRouteButtons();
+          }});
+          routeButtonsContainer.appendChild(button);
+          routeButtons.push(button);
+        }});
+        refreshRouteButtons();
+        if (!routeStatus.textContent) {{
+          setRouteStatus("Choose an action button to interrupt the random walk and follow the saved shortest path.");
+        }}
+      }}
+
+      function toggleActionLock() {{
+        if (!actionLockEnabled) {{
+          const nextAction = actionAtNodeId(currentActionAnchorNodeId());
+          if (!nextAction) {{
+            setRouteStatus("Action lock will take effect after the walker reaches a node.");
+            return;
+          }}
+          actionLockEnabled = true;
+          lockedAction = nextAction;
+          setRouteStatus(`Single-action mode enabled for ${{lockedAction}}.`);
+        }} else {{
+          actionLockEnabled = false;
+          lockedAction = null;
+          setRouteStatus("Single-action mode disabled. Random walk can cross actions again.");
+        }}
+        refreshRouteButtons();
+      }}
+
+      function setHighlightedEdge(edgeId) {{
+        if (activeHighlightedEdge) {{
+          activeHighlightedEdge.classList.remove("guided-edge");
+        }}
+        activeHighlightedEdge = edgeId ? document.getElementById(edgeId) : null;
+        if (activeHighlightedEdge && walkerMode === "guided") {{
+          activeHighlightedEdge.classList.add("guided-edge");
+        }}
       }}
 
       function activateEdge(edgeId, timestamp) {{
+        setHighlightedEdge(null);
         currentEdgeId = edgeId;
         currentPath = document.getElementById(edgeId);
         if (!currentPath) {{
@@ -1384,11 +2043,21 @@ def render_html(
         edgeLength = Math.max(currentPath.getTotalLength(), 1);
         edgeDuration = logicalEdgeDurationMs(edgeId);
         edgeStartTime = timestamp;
+        primeEdgeImages(edgeId);
+        const edge = walkerData.edges[edgeId];
+        if (edge) {{
+          primeOutgoingEdgeImages(edge.target);
+        }}
+        setHighlightedEdge(edgeId);
+        refreshRouteButtons();
+        updatePreview(0);
       }}
 
       function step(timestamp) {{
         if (!currentEdgeId) {{
-          activateEdge(pickRandom(edgeIds), timestamp);
+          const startEdgeId = seededInitialEdgeId || pickRandom(randomEdgeIds);
+          seededInitialEdgeId = null;
+          activateEdge(startEdgeId, timestamp);
         }}
         if (!currentPath) {{
           requestAnimationFrame(step);
@@ -1403,7 +2072,38 @@ def render_html(
 
         if (progress >= 1) {{
           const edge = walkerData.edges[currentEdgeId];
-          activateEdge(chooseNextEdge(edge.target), timestamp);
+          if (walkerMode === "guided") {{
+            if (queuedRouteEdgeIds.length > 0) {{
+              const nextRouteEdgeId = queuedRouteEdgeIds.shift();
+              activateEdge(nextRouteEdgeId, timestamp);
+              if (queuedRouteTargetAction && routeStatus) {{
+                setRouteStatus(
+                  `Following shortest path to ${{queuedRouteTargetAction}}. Remaining edges: ${{queuedRouteEdgeIds.length}}.`
+                );
+              }}
+            }} else {{
+              const reachedAction = queuedRouteTargetAction;
+              walkerMode = "random";
+              queuedRouteTargetAction = null;
+              setHighlightedEdge(null);
+              if (actionLockEnabled) {{
+                lockedAction = reachedAction || actionAtNodeId(edge.target) || lockedAction;
+              }}
+              if (reachedAction) {{
+                if (actionLockEnabled && lockedAction) {{
+                  setRouteStatus(`Arrived at ${{reachedAction}}. Continuing within ${{lockedAction}} only.`);
+                }} else {{
+                  setRouteStatus(`Arrived at ${{reachedAction}}. Random walk resumed.`);
+                }}
+              }}
+              activateEdge(chooseRandomEdge(edge.target), timestamp);
+            }}
+          }} else {{
+            if (actionLockEnabled && !lockedAction) {{
+              lockedAction = actionAtNodeId(edge.target);
+            }}
+            activateEdge(chooseRandomEdge(edge.target), timestamp);
+          }}
         }}
 
         requestAnimationFrame(step);
@@ -1419,7 +2119,20 @@ def render_html(
           setWalkerFps(event.target.value);
         }});
       }}
+      if (actionLockButton) {{
+        actionLockButton.addEventListener("click", () => {{
+          toggleActionLock();
+        }});
+      }}
+      buildRouteButtons();
+      syncActionLockButton();
       syncFpsControls();
+      seededInitialEdgeId = pickRandom(randomEdgeIds);
+      primeEdgeImages(seededInitialEdgeId);
+      const seededEdge = walkerData.edges[seededInitialEdgeId];
+      if (seededEdge) {{
+        primeOutgoingEdgeImages(seededEdge.target);
+      }}
       requestAnimationFrame(step);
     }}
   </script>
@@ -1428,48 +2141,118 @@ def render_html(
 """
 
 
-def save_motion_graph_visualization(
+def create_motion_graph_app(
+    motion_graph_path: Path,
     payload: Dict[str, Any],
-    output_path: Path,
     frame_spacing: int = 58,
     lane_spacing: int = 72,
     max_transition_edges: int = 0,
     fps: float = 30.0,
+    view_mode: str = "graph",
     image_manifest_path: Optional[Path] = None,
-) -> Path:
+) -> Any:
+    try:
+        from flask import Flask, abort, send_file
+    except ImportError as exc:
+        raise RuntimeError(
+            "Flask is required for the web visualizer. Install it with `pip install flask`."
+        ) from exc
+
     payload = normalize_motion_graph_payload(dict(payload))
-    image_assets = resolve_image_manifest_assets(
-        output_path=output_path,
-        image_manifest_path=image_manifest_path,
+    image_assets = None
+    if view_mode == "image":
+        image_assets = resolve_image_manifest_assets(
+            motion_graph_path=motion_graph_path,
+            image_manifest_path=image_manifest_path,
+            required=True,
+        )
+    shortest_path_assets = resolve_shortest_path_assets(
+        motion_graph_path=motion_graph_path,
     )
-    html_text = render_html(
+    asset_files = {} if image_assets is None else image_assets["asset_files"]
+    page_html = render_html(
         payload=payload,
         frame_spacing=frame_spacing,
         lane_spacing=lane_spacing,
         max_transition_edges=max_transition_edges,
         fps=fps,
         image_assets=image_assets,
+        shortest_path_assets=shortest_path_assets,
+        view_mode=view_mode,
     )
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(html_text, encoding="utf-8")
-    return output_path
+
+    app = Flask(__name__)
+
+    @app.route("/")
+    def index() -> str:
+        return page_html
+
+    @app.route("/assets/<asset_id>")
+    def serve_asset(asset_id: str) -> Any:
+        asset_path = asset_files.get(asset_id)
+        if asset_path is None or not asset_path.exists():
+            abort(404)
+        return send_file(asset_path, conditional=True, max_age=3600)
+
+    return app
+
+
+def serve_motion_graph_visualization(
+    motion_graph_path: Path,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    frame_spacing: int = 58,
+    lane_spacing: int = 72,
+    max_transition_edges: int = 0,
+    fps: float = 30.0,
+    view_mode: str = "graph",
+    image_manifest_path: Optional[Path] = None,
+) -> None:
+    motion_graph_path = motion_graph_path.resolve()
+    payload = normalize_motion_graph_payload(load_motion_graph(motion_graph_path))
+    app = create_motion_graph_app(
+        motion_graph_path=motion_graph_path,
+        payload=payload,
+        frame_spacing=frame_spacing,
+        lane_spacing=lane_spacing,
+        max_transition_edges=max_transition_edges,
+        fps=fps,
+        view_mode=view_mode,
+        image_manifest_path=image_manifest_path,
+    )
+    bind_error = port_bind_error(host, port)
+    if bind_error is not None:
+        suggestions = suggest_available_ports(host, port)
+        suggestion_text = ""
+        if suggestions:
+            suggestion_text = " Try one of: " + ", ".join(f"--port {item}" for item in suggestions) + "."
+        raise SystemExit(
+            f"Cannot start the Flask visualizer on {host}:{port}: {bind_error}.{suggestion_text}"
+        )
+    display_host = "127.0.0.1" if host == "0.0.0.0" else host
+    print(f"Serving motion graph visualization at http://{display_host}:{port}")
+    app.run(host=host, port=port, debug=False, use_reloader=False)
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    payload = normalize_motion_graph_payload(
-        load_motion_graph(Path(args.motion_graph))
-    )
-    output_path = save_motion_graph_visualization(
-        payload=payload,
-        output_path=Path(args.output),
+    if args.output:
+        print(
+            f"Ignoring deprecated --output value {args.output!r}; "
+            "static HTML export was removed in favor of the Flask visualizer."
+        )
+
+    serve_motion_graph_visualization(
+        motion_graph_path=Path(args.motion_graph),
+        host=args.host,
+        port=args.port,
         frame_spacing=args.frame_spacing,
         lane_spacing=args.lane_spacing,
         max_transition_edges=args.max_transition_edges,
         fps=args.fps,
+        view_mode=args.mode,
         image_manifest_path=None if args.image_manifest is None else Path(args.image_manifest),
     )
-    print(f"Saved motion graph visualization to {output_path}")
 
 
 if __name__ == "__main__":

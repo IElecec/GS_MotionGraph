@@ -1,10 +1,6 @@
 import argparse
 from pathlib import Path
 
-from motion_graph import MotionGraph
-from utils import Database
-from visualize_motion_graph import save_motion_graph_visualization
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -46,25 +42,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="do not prune the graph to its largest strongly connected component",
     )
     parser.add_argument(
-        "--visualization",
-        help="optional output HTML path for a motion-graph visualization",
-    )
-    parser.add_argument(
-        "--max-visualized-transitions",
-        type=int,
-        default=0,
-        help="limit rendered cross-action transition edges in the optional HTML output; <= 0 renders all",
-    )
-    parser.add_argument(
-        "--visualization-fps",
-        type=float,
-        default=30.0,
-        help="logical playback fps used by the random walker in the optional HTML visualization",
-    )
-    parser.add_argument(
-        "--image-manifest",
-        default=None,
-        help="optional manifest.json produced by render_image_library.py; enables image playback in the HTML visualization",
+        "--shortest-path",
+        action="store_true",
+        help="also export shortest path data",
     )
     return parser
 
@@ -72,6 +52,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    from motion_graph import MotionGraph
+    from utils import Database
 
     database = Database(Path(args.database))
     motion_graph = MotionGraph.build(
@@ -82,21 +65,18 @@ def main() -> None:
         prune_dead_ends=not args.keep_dead_ends,
     )
     output_path = motion_graph.save(Path(args.output))
-    visualization_path = None
-    if args.visualization:
-        visualization_path = save_motion_graph_visualization(
-            payload=motion_graph.to_dict(),
-            output_path=Path(args.visualization),
-            max_transition_edges=args.max_visualized_transitions,
-            fps=args.visualization_fps,
-            image_manifest_path=None if args.image_manifest is None else Path(args.image_manifest),
+    shortest_path_output = None
+    if args.shortest_path:
+        shortest_path_output = motion_graph.save_shortest_paths_to_all_other_actions(
+            output_path=output_path.parent,
         )
+
     print(
         f"Saved motion graph with {len(motion_graph.nodes)} nodes and "
         f"{len(motion_graph.edges)} edges to {output_path}"
     )
-    if visualization_path is not None:
-        print(f"Saved motion graph visualization to {visualization_path}")
+    if shortest_path_output is not None:
+        print(f"Saved shortest path data at {shortest_path_output}")
 
 
 if __name__ == "__main__":

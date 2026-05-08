@@ -1,4 +1,5 @@
 import json
+import heapq
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -121,6 +122,18 @@ def _transition_key(source: FrameRef, target: FrameRef) -> TransitionKey:
     return (source.key(), target.key())
 
 
+def _node_id_from_key(key: FrameKey) -> str:
+    return f"{key[0]}|{key[1]}|{int(key[2])}"
+
+
+def _slugify_token(value: str) -> str:
+    slug = "".join(
+        character if character.isalnum() or character in ("-", "_") else "_"
+        for character in value
+    ).strip("_")
+    return slug or "value"
+
+
 def _transition_edge_length_lookup(edges: List[GraphEdge]) -> Dict[TransitionKey, int]:
     lookup: Dict[TransitionKey, int] = {}
     for edge in edges:
@@ -209,6 +222,46 @@ def _collect_component(node: FrameKey, graph: Dict[FrameKey, List[FrameKey]], vi
     for neighbor in graph.get(node, []):
         if neighbor not in visited:
             _collect_component(neighbor, graph, visited, component)
+
+
+def _weighted_edge_cost(
+    edge: GraphEdge,
+    frame_weight: float,
+    transition_distance_weight: float,
+) -> float:
+    return (
+        float(frame_weight) * max(0, int(edge.length))
+        + float(transition_distance_weight) * float(edge.distance)
+    )
+
+
+def _is_better_path(
+    candidate: Tuple[float, int, float, int],
+    current: Optional[Tuple[float, int, float, int]],
+    tolerance: float = 1e-12,
+) -> bool:
+    if current is None:
+        return True
+
+    candidate_cost, candidate_frames, candidate_transition_distance, candidate_transition_count = candidate
+    current_cost, current_frames, current_transition_distance, current_transition_count = current
+
+    if candidate_cost < current_cost - tolerance:
+        return True
+    if abs(candidate_cost - current_cost) > tolerance:
+        return False
+
+    if candidate_frames < current_frames:
+        return True
+    if candidate_frames != current_frames:
+        return False
+
+    if candidate_transition_distance < current_transition_distance - tolerance:
+        return True
+    if abs(candidate_transition_distance - current_transition_distance) > tolerance:
+        return False
+
+    return candidate_transition_count < current_transition_count
 
 
 @dataclass
@@ -368,6 +421,301 @@ class MotionGraph:
             transitions=transitions,
             window_size=self.window_size,
         )
+
+    def shortest_paths_to_action(
+        self,
+        target_action: str,
+        frame_weight: float = 1.0,
+        transition_distance_weight: float = 1.0,
+    ) -> Dict[str, Any]:
+        if frame_weight < 0.0:
+            raise ValueError("frame_weight must be non-negative.")
+        if transition_distance_weight < 0.0:
+            raise ValueError("transition_distance_weight must be non-negative.")
+        if frame_weight == 0.0 and transition_distance_weight == 0.0:
+            raise ValueError("At least one path-cost weight must be positive.")
+
+        node_lookup: Dict[FrameKey, FrameRef] = {
+            node.key(): node for node in self.nodes
+        }
+        if not node_lookup:
+            raise ValueError("Motion graph has no nodes.")
+
+        available_actions = sorted({node.action for node in self.nodes})
+        target_keys = sorted(
+            key for key in node_lookup
+            if key[0] == target_action
+        )
+        if not target_keys:
+            raise ValueError(
+                f"Target action {target_action!r} does not exist in the motion graph. "
+                f"Available actions: {available_actions}"
+            )
+
+        reverse_adjacency: Dict[FrameKey, List[Tuple[FrameKey, GraphEdge]]] = {}
+        for edge in self.edges:
+            reverse_adjacency.setdefault(edge.target.key(), []).append(
+                (edge.source.key(), edge)
+            )
+
+        best_state: Dict[FrameKey, Tuple[float, int, float, int]] = {}
+        next_node: Dict[FrameKey, FrameKey] = {}
+        next_edge: Dict[FrameKey, GraphEdge] = {}
+        heap: List[Tuple[float, int, float, int, FrameKey]] = []
+
+        for key in target_keys:
+            best_state[key] = (0.0, 0, 0.0, 0)
+            heapq.heappush(heap, (0.0, 0, 0.0, 0, key))
+
+        while heap:
+            cost, frames, transition_distance, transition_count, node_key = heapq.heappop(heap)
+            current_state = best_state.get(node_key)
+            if current_state is None:
+                continue
+
+            if (
+                abs(cost - current_state[0]) > 1e-12
+                or frames != current_state[1]
+                or abs(transition_distance - current_state[2]) > 1e-12
+                or transition_count != current_state[3]
+            ):
+                continue
+
+            for predecessor_key, edge in reverse_adjacency.get(node_key, []):
+                edge_cost = _weighted_edge_cost(
+                    edge,
+                    frame_weight=frame_weight,
+                    transition_distance_weight=transition_distance_weight,
+                )
+                candidate_state = (
+                    cost + edge_cost,
+                    frames + max(0, int(edge.length)),
+                    transition_distance + float(edge.distance),
+                    transition_count + (1 if edge.kind == "transition" else 0),
+                )
+                if not _is_better_path(
+                    candidate_state,
+                    best_state.get(predecessor_key),
+                ):
+                    continue
+
+                best_state[predecessor_key] = candidate_state
+                next_node[predecessor_key] = node_key
+                next_edge[predecessor_key] = edge
+                heapq.heappush(
+                    heap,
+                    (
+                        candidate_state[0],
+                        candidate_state[1],
+                        candidate_state[2],
+                        candidate_state[3],
+                        predecessor_key,
+                    ),
+                )
+
+        target_key_set = set(target_keys)
+        paths: List[Dict[str, Any]] = []
+        reachable_count = 0
+
+        for source_key in sorted(node_lookup):
+            source_ref = node_lookup[source_key]
+            path_record: Dict[str, Any] = {
+                "source": source_ref.to_dict(),
+                "source_id": _node_id_from_key(source_key),
+                "target_action": target_action,
+            }
+            state = best_state.get(source_key)
+            if state is None:
+                path_record["reachable"] = False
+                paths.append(path_record)
+                continue
+
+            reachable_count += 1
+            total_cost, total_frames, total_transition_distance, total_transition_count = state
+            cursor = source_key
+            path_nodes = [source_ref.to_dict()]
+            path_edges: List[Dict[str, Any]] = []
+
+            for _ in range(len(self.nodes) + 1):
+                if cursor in target_key_set:
+                    break
+
+                edge = next_edge.get(cursor)
+                successor_key = next_node.get(cursor)
+                if edge is None or successor_key is None:
+                    raise RuntimeError(
+                        f"Shortest-path reconstruction failed for node {source_key}."
+                    )
+
+                path_edges.append(
+                    {
+                        **edge.to_dict(),
+                        "cost": _weighted_edge_cost(
+                            edge,
+                            frame_weight=frame_weight,
+                            transition_distance_weight=transition_distance_weight,
+                        ),
+                    }
+                )
+                path_nodes.append(node_lookup[successor_key].to_dict())
+                cursor = successor_key
+            else:
+                raise RuntimeError(
+                    f"Shortest-path reconstruction exceeded graph size for node {source_key}."
+                )
+
+            path_record.update(
+                {
+                    "reachable": True,
+                    "target": node_lookup[cursor].to_dict(),
+                    "target_id": _node_id_from_key(cursor),
+                    "total_cost": float(total_cost),
+                    "total_frames": int(total_frames),
+                    "total_transition_distance": float(total_transition_distance),
+                    "num_transitions": int(total_transition_count),
+                    "num_edges": len(path_edges),
+                    "path": path_nodes,
+                    "edges": path_edges,
+                }
+            )
+            paths.append(path_record)
+
+        return {
+            "database_dir": str(self.database.base_dir),
+            "target_action": target_action,
+            "available_actions": available_actions,
+            "cost_function": {
+                "formula": (
+                    "sum(frame_weight * edge.length + "
+                    "transition_distance_weight * edge.distance)"
+                ),
+                "frame_weight": float(frame_weight),
+                "transition_distance_weight": float(transition_distance_weight),
+            },
+            "num_nodes": len(self.nodes),
+            "num_reachable_nodes": reachable_count,
+            "num_unreachable_nodes": len(self.nodes) - reachable_count,
+            "target_nodes": [node_lookup[key].to_dict() for key in target_keys],
+            "paths": paths,
+        }
+
+    def save_shortest_paths_to_action(
+        self,
+        output_path: Path,
+        target_action: str,
+        frame_weight: float = 1.0,
+        transition_distance_weight: float = 1.0,
+    ) -> Path:
+        if output_path.suffix == "":
+            output_path = output_path / f"shortest_paths_to_{_slugify_token(target_action)}.json"
+
+        payload = self.shortest_paths_to_action(
+            target_action=target_action,
+            frame_weight=frame_weight,
+            transition_distance_weight=transition_distance_weight,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        return output_path
+
+    def shortest_paths_to_all_other_actions(
+        self,
+        frame_weight: float = 1.0,
+        transition_distance_weight: float = 1.0,
+    ) -> Dict[str, Any]:
+        available_actions = sorted({node.action for node in self.nodes})
+        node_lookup: Dict[FrameKey, FrameRef] = {
+            node.key(): node for node in self.nodes
+        }
+
+        if not node_lookup:
+            raise ValueError("Motion graph has no nodes.")
+
+        payloads_by_target_action = {
+            action: self.shortest_paths_to_action(
+                target_action=action,
+                frame_weight=frame_weight,
+                transition_distance_weight=transition_distance_weight,
+            )
+            for action in available_actions
+        }
+        records_by_target_action = {
+            action: {
+                record["source_id"]: record
+                for record in payload["paths"]
+            }
+            for action, payload in payloads_by_target_action.items()
+        }
+
+        source_nodes: List[Dict[str, Any]] = []
+        for source_key in sorted(node_lookup):
+            source_ref = node_lookup[source_key]
+            source_id = _node_id_from_key(source_key)
+            paths_to_other_actions: List[Dict[str, Any]] = []
+
+            for target_action in available_actions:
+                if target_action == source_ref.action:
+                    continue
+
+                target_record = dict(records_by_target_action[target_action][source_id])
+                target_record.pop("source", None)
+                target_record.pop("source_id", None)
+                paths_to_other_actions.append(target_record)
+
+            source_nodes.append(
+                {
+                    "source": source_ref.to_dict(),
+                    "source_id": source_id,
+                    "source_action": source_ref.action,
+                    "paths_to_other_actions": paths_to_other_actions,
+                }
+            )
+
+        target_action_summaries = [
+            {
+                "target_action": action,
+                "num_target_nodes": len(payload["target_nodes"]),
+                "num_reachable_nodes": payload["num_reachable_nodes"],
+                "num_unreachable_nodes": payload["num_unreachable_nodes"],
+            }
+            for action, payload in payloads_by_target_action.items()
+        ]
+
+        return {
+            "database_dir": str(self.database.base_dir),
+            "available_actions": available_actions,
+            "cost_function": {
+                "formula": (
+                    "sum(frame_weight * edge.length + "
+                    "transition_distance_weight * edge.distance)"
+                ),
+                "frame_weight": float(frame_weight),
+                "transition_distance_weight": float(transition_distance_weight),
+            },
+            "num_actions": len(available_actions),
+            "num_nodes": len(self.nodes),
+            "target_action_summaries": target_action_summaries,
+            "source_nodes": source_nodes,
+        }
+
+    def save_shortest_paths_to_all_other_actions(
+        self,
+        output_path: Path,
+        frame_weight: float = 1.0,
+        transition_distance_weight: float = 1.0,
+    ) -> Path:
+        if output_path.suffix == "":
+            output_path = output_path / "shortest_path.json"
+
+        payload = self.shortest_paths_to_all_other_actions(
+            frame_weight=frame_weight,
+            transition_distance_weight=transition_distance_weight,
+        )
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+        return output_path
 
     def to_dict(self) -> Dict[str, Any]:
         return {

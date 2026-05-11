@@ -22,7 +22,8 @@ python compute_similarity.py -m "D:\Files\Data\char1\anim_base\char1" -o outputs
 ### 2. 构建 motion graph，并导出 shortest path
 
 ```bash
-python build_motion_graph.py -m "D:\Files\Data\char1\anim_base\char1" -s outputs/char1 -o outputs/char1/motion_graph.json --shortest-path --distance-threshold 0.5 --top-k-intra-sequence 4 --top-k-inter-animation 5 --top-k-inter-sequence 4
+python build_motion_graph.py -m "D:\Files\Data\char1\anim_base\char1" -s outputs/char1 -o outputs/char1/motion_graph.json --shortest-path --distance-threshold 0.5 --top-k-intra-sequence 6 --top-k-inter-animation 6 --top-k-inter-sequence 6
+# --path-length-weight 1.0 --path-distance-weight 2.0
 ```
 
 其中：
@@ -30,6 +31,8 @@ python build_motion_graph.py -m "D:\Files\Data\char1\anim_base\char1" -s outputs
 - `--top-k-intra-sequence` 控制同一个 `action/animation` 内部候选 transition 的保留数
 - `--top-k-inter-animation` 控制同一个 `action` 下不同 `animation` 之间候选 transition 的保留数
 - `--top-k-inter-sequence` 控制不同 `action` 之间候选 transition 的保留数
+- `--path-length-weight` 控制 shortest path 里 `edge.length` 的权重，默认 `1.0`
+- `--path-distance-weight` 控制 shortest path 里 `edge.distance` 的权重，默认 `1.0`
 - 如果你只传 `--top-k`，它会作为以上三类情况的默认值
 - 如果你不传 `--top-k-inter-animation`，它会默认继承 `--top-k-inter-sequence`
 
@@ -40,7 +43,7 @@ python build_motion_graph.py -m "D:\Files\Data\char1\anim_base\char1" -s outputs
 - `outputs/char1/motion_graph_after_prune.svg`
 - `outputs/char1/shortest_path.json`
 
-`shortest_path.json` 会被可视化页面用来驱动 `To <action>` 按钮。
+`shortest_path.json` 会被可视化页面用来驱动 `To <action>`、同 action 下回到常规序列起点，以及 `Stay Within Current Action` 到序列末尾后的回路选择。
 `motion_graph_before_prune.svg` 是裁剪前的 motion graph 静态图片。
 `motion_graph_after_prune.svg` 是裁剪后的 motion graph 静态图片。
 
@@ -58,7 +61,7 @@ python render_image_library.py \
   -t "outputs\char1\transitions" \
   -o "outputs\char1\rendered_images_front" \
   --camera-position "-2.9414925575256348, 1.4234471321105957, -1.035473346710205" \
-  --camera-target "0.2563316226005554, 0.7723545432090759, 0.8107913136482239"
+  --camera-target "0.2563316226005554, 0.7723545432090759, 0.8107913136482239" 
 
 python render_image_library.py \
   -m "D:\Files\Data\char1\anim_base\char1" \

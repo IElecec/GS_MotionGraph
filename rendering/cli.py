@@ -37,7 +37,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--background", default="1,1,1", help="Background RGB in [0,1], e.g. 1,1,1")
     parser.add_argument(
         "--overwrite",
-        default=True,
         action="store_true",
         help="Overwrite existing rendered PNG files instead of skipping them.",
     )

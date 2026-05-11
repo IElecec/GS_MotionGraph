@@ -429,24 +429,6 @@ HTML_TEMPLATE = """<!doctype html>
       const assetNonce = String(Date.now());
       const imageCache = new Map();
       const edgesByAction = {};
-      const incoming = {};
-      const laneStarts = {};
-      const returnRouteCache = new Map();
-
-      Object.entries(data.nodes).forEach(([nodeId, node]) => {
-        const laneId = `${node.action}|${node.animation}`;
-        const current = laneStarts[laneId];
-        if (!current || Number(node.frame) < Number(current.frame)) {
-          laneStarts[laneId] = { nodeId, frame: Number(node.frame) };
-        }
-      });
-
-      Object.entries(data.edges).forEach(([edgeId, edge]) => {
-        if (!incoming[edge.target]) {
-          incoming[edge.target] = [];
-        }
-        incoming[edge.target].push(edgeId);
-      });
 
       function setStatus(text) {
         if (status) {
@@ -485,11 +467,6 @@ HTML_TEMPLATE = """<!doctype html>
       function currentNodeId() {
         const edge = data.edges[currentEdgeId];
         return edge ? edge.target : null;
-      }
-
-      function laneIdForNode(nodeId) {
-        const info = nodeInfo(nodeId);
-        return info ? `${info.action}|${info.animation}` : null;
       }
 
       function pick(list) {
@@ -635,130 +612,34 @@ HTML_TEMPLATE = """<!doctype html>
         });
       }
 
-      function comparePathState(left, right) {
-        for (let index = 0; index < left.length; index += 1) {
-          if (left[index] < right[index]) {
-            return -1;
-          }
-          if (left[index] > right[index]) {
-            return 1;
-          }
+      function sequenceStartRoute(nodeId) {
+        if (!nodeId) {
+          return null;
         }
-        return 0;
+        const routes = data.routes?.sequence_start_routes || {};
+        return routes[nodeId] || null;
       }
 
-      function betterPathState(candidate, current) {
-        return !current || comparePathState(candidate, current) < 0;
+      function actionRoute(action) {
+        const startNode = currentNodeId();
+        if (!startNode) {
+          return null;
+        }
+        if (nodeAction(startNode) === action) {
+          return sequenceStartRoute(startNode);
+        }
+        const sourceRoutes = (data.routes && data.routes.source_routes[startNode]) || {};
+        return sourceRoutes[action] || null;
       }
 
-      function edgeCost(edge) {
-        return Math.max(0, Number(edge?.length) || 0) + (Number(edge?.distance) || 0);
-      }
-
-      function shortestPathWithinAction(sourceNodeId, targetNodeId, action) {
-        const cacheKey = `${sourceNodeId}->${targetNodeId}`;
-        const cached = returnRouteCache.get(cacheKey);
-        if (cached) {
-          return cached;
-        }
-        if (!sourceNodeId || !targetNodeId || sourceNodeId === targetNodeId) {
-          const direct = {
-            reachable: sourceNodeId === targetNodeId,
-            edge_ids: [],
-            total_cost: 0,
-            total_frames: 0,
-            total_transition_distance: 0,
-            num_transitions: 0,
-          };
-          returnRouteCache.set(cacheKey, direct);
-          return direct;
-        }
-
-        const best = new Map([[targetNodeId, [0, 0, 0, 0]]]);
-        const nextEdge = new Map();
-        const nextNode = new Map();
-        const heap = [{ nodeId: targetNodeId, state: [0, 0, 0, 0] }];
-
-        while (heap.length > 0) {
-          heap.sort((left, right) => comparePathState(left.state, right.state));
-          const current = heap.shift();
-          const currentBest = best.get(current.nodeId);
-          if (!currentBest || comparePathState(current.state, currentBest) !== 0) {
-            continue;
-          }
-
-          (incoming[current.nodeId] || []).forEach((edgeId) => {
-            const edge = data.edges[edgeId];
-            if (!edge) {
-              return;
-            }
-            const source = nodeInfo(edge.source);
-            const target = nodeInfo(edge.target);
-            if (!source || !target || source.action !== action || target.action !== action) {
-              return;
-            }
-
-            const candidate = [
-              current.state[0] + edgeCost(edge),
-              current.state[1] + Math.max(0, Number(edge.length) || 0),
-              current.state[2] + (Number(edge.distance) || 0),
-              current.state[3] + (edge.kind === "transition" ? 1 : 0),
-            ];
-            if (!betterPathState(candidate, best.get(edge.source))) {
-              return;
-            }
-            best.set(edge.source, candidate);
-            nextEdge.set(edge.source, edgeId);
-            nextNode.set(edge.source, current.nodeId);
-            heap.push({ nodeId: edge.source, state: candidate });
-          });
-        }
-
-        const state = best.get(sourceNodeId);
-        if (!state) {
-          const missing = {
-            reachable: false,
-            edge_ids: [],
-            total_cost: 0,
-            total_frames: 0,
-            total_transition_distance: 0,
-            num_transitions: 0,
-          };
-          returnRouteCache.set(cacheKey, missing);
-          return missing;
-        }
-
-        const edgeIds = [];
-        let cursor = sourceNodeId;
-        while (cursor !== targetNodeId) {
-          const edgeId = nextEdge.get(cursor);
-          const nextId = nextNode.get(cursor);
-          if (!edgeId || !nextId) {
-            const broken = {
-              reachable: false,
-              edge_ids: [],
-              total_cost: 0,
-              total_frames: 0,
-              total_transition_distance: 0,
-              num_transitions: 0,
-            };
-            returnRouteCache.set(cacheKey, broken);
-            return broken;
-          }
-          edgeIds.push(edgeId);
-          cursor = nextId;
-        }
-
-        const route = {
-          reachable: true,
-          edge_ids: edgeIds,
-          total_cost: Number(state[0]) || 0,
-          total_frames: Number(state[1]) || 0,
-          total_transition_distance: Number(state[2]) || 0,
-          num_transitions: Number(state[3]) || 0,
-        };
-        returnRouteCache.set(cacheKey, route);
-        return route;
+      function beginGuidedRoute(route, metadata, statusText) {
+        guidedRoute = metadata;
+        routeTarget = metadata.routeTarget || null;
+        routeQueue = Array.isArray(route?.edge_ids) ? [...route.edge_ids] : [];
+        walkMode = "guided";
+        routeQueue.forEach((edgeId) => warmEdge(edgeId));
+        setStatus(statusText);
+        refreshActionButtons();
       }
 
       function maybeStartLockReturnRoute(fromNodeId) {
@@ -766,29 +647,21 @@ HTML_TEMPLATE = """<!doctype html>
           return null;
         }
         const source = nodeInfo(fromNodeId);
-        const laneId = laneIdForNode(fromNodeId);
-        const laneStart = laneId ? laneStarts[laneId] : null;
-        if (!source || source.action !== lockAction || !laneStart || laneStart.nodeId === fromNodeId) {
-          return null;
-        }
-        const route = shortestPathWithinAction(fromNodeId, laneStart.nodeId, lockAction);
-        if (!route.reachable || !route.edge_ids.length) {
+        const route = sequenceStartRoute(fromNodeId);
+        if (!source || source.action !== lockAction || !route || !route.reachable || !route.edge_ids.length) {
           return null;
         }
 
-        guidedRoute = {
-          kind: "lock-return",
-          action: lockAction,
-          animation: source.animation,
-          targetNodeId: laneStart.nodeId,
-          startFrame: laneStart.frame,
-        };
-        routeTarget = null;
-        routeQueue = [...route.edge_ids];
-        walkMode = "guided";
-        routeQueue.forEach((edgeId) => warmEdge(edgeId));
-        setStatus(`Reached the end of ${source.animation}. Returning to frame ${laneStart.frame} inside ${lockAction}.`);
-        refreshActionButtons();
+        beginGuidedRoute(
+          route,
+          {
+            kind: "lock-return",
+            action: lockAction,
+            animation: route.target_animation || source.animation,
+            startFrame: Number(route.target_frame) || 0,
+          },
+          `Reached the end of ${source.animation}. Returning to frame ${route.target_frame} inside ${lockAction}.`
+        );
         return routeQueue.shift() || null;
       }
 
@@ -816,18 +689,6 @@ HTML_TEMPLATE = """<!doctype html>
           return pick(outgoing);
         }
         return pick(data.edge_ids);
-      }
-
-      function currentRoute(action) {
-        const startNode = currentNodeId();
-        if (!startNode) {
-          return null;
-        }
-        if (nodeAction(startNode) === action) {
-          return { reachable: true, edge_ids: [], total_frames: 0, num_transitions: 0 };
-        }
-        const sourceRoutes = (data.routes && data.routes.source_routes[startNode]) || {};
-        return sourceRoutes[action] || null;
       }
 
       function updateLockButton() {
@@ -858,7 +719,7 @@ HTML_TEMPLATE = """<!doctype html>
         }
         actionButtons.querySelectorAll("button").forEach((button) => {
           const action = button.dataset.action;
-          const route = currentRoute(action);
+          const route = actionRoute(action);
           button.disabled = !route || !route.reachable;
           button.classList.toggle("active", walkMode === "guided" && routeTarget === action);
         });
@@ -866,26 +727,47 @@ HTML_TEMPLATE = """<!doctype html>
       }
 
       function routeToAction(action) {
-        const route = currentRoute(action);
+        const startNode = currentNodeId();
+        const currentAction = nodeAction(startNode);
+        const route = actionRoute(action);
         if (!route || !route.reachable) {
-          setStatus(`No route from the current node to ${action}.`);
+          setStatus(
+            currentAction === action
+              ? `No precomputed route from the next ${action} node back to its sequence start.`
+              : `No route from the current node to ${action}.`
+          );
           refreshActionButtons();
           return;
         }
-        guidedRoute = {
-          kind: "action",
-          action,
-        };
-        routeTarget = action;
-        routeQueue = Array.isArray(route.edge_ids) ? [...route.edge_ids] : [];
-        walkMode = "guided";
-        routeQueue.forEach((edgeId) => warmEdge(edgeId));
-        if (routeQueue.length > 0) {
-          setStatus(`Following shortest path to ${action}.`);
-        } else {
-          setStatus(`Already entering ${action}. Random walk will resume after this edge.`);
+
+        if (currentAction === action) {
+          beginGuidedRoute(
+            route,
+            {
+              kind: "same-action-return",
+              action,
+              animation: route.target_animation || nodeInfo(startNode)?.animation || action,
+              startFrame: Number(route.target_frame) || 0,
+              routeTarget: action,
+            },
+            route.edge_ids.length > 0
+              ? `After the next ${action} node, returning to frame ${route.target_frame} of ${route.target_animation}.`
+              : `The next ${action} node is already frame ${route.target_frame} of ${route.target_animation}.`
+          );
+          return;
         }
-        refreshActionButtons();
+
+        beginGuidedRoute(
+          route,
+          {
+            kind: "action",
+            action,
+            routeTarget: action,
+          },
+          route.edge_ids.length > 0
+            ? `Following shortest path to ${action}.`
+            : `Already entering ${action}. Random walk will resume after this edge.`
+        );
       }
 
       function buildActionButtons() {
@@ -893,7 +775,7 @@ HTML_TEMPLATE = """<!doctype html>
           return;
         }
         if (!data.routes || !data.routes.actions.length) {
-          actionButtons.innerHTML = "<span style='color: var(--muted);'>Build with --shortest-path to enable action routing.</span>";
+          actionButtons.innerHTML = "<span style='color: var(--muted);'>Build with --shortest-path to enable action routing and return-to-start routing.</span>";
           return;
         }
 
@@ -1027,7 +909,7 @@ HTML_TEMPLATE = """<!doctype html>
               if (lockEnabled && completedRoute?.kind === "action") {
                 lockAction = reached || nodeAction(edge.target) || lockAction;
               }
-              if (completedRoute?.kind === "lock-return") {
+              if (completedRoute?.kind === "lock-return" || completedRoute?.kind === "same-action-return") {
                 setStatus(
                   lockEnabled
                     ? `Returned to frame ${completedRoute.startFrame} of ${completedRoute.animation}. Continuing inside ${completedRoute.action}.`
@@ -1252,23 +1134,32 @@ def load_routes(graph_path: Path) -> Optional[Dict[str, Any]]:
 
     raw = load_json(path)
     routes: Dict[str, Dict[str, Any]] = {}
+    sequence_start_routes: Dict[str, Dict[str, Any]] = {}
 
     if "source_nodes" in raw:
         for source in raw.get("source_nodes", []):
-            routes[source["source_id"]] = {
+            source_id = source["source_id"]
+            routes[source_id] = {
                 route["target_action"]: route
                 for route in source.get("paths_to_other_actions", [])
                 if route.get("target_action")
             }
+            sequence_route = source.get("path_to_sequence_start")
+            if isinstance(sequence_route, dict):
+                sequence_start_routes[source_id] = sequence_route
         actions = list(raw.get("available_actions", []))
     else:
         actions = list(raw.get("actions", []))
         for source_id, entry in raw.get("sources", {}).items():
             routes[source_id] = dict(entry.get("routes", {}))
+            sequence_route = entry.get("path_to_sequence_start")
+            if isinstance(sequence_route, dict):
+                sequence_start_routes[source_id] = sequence_route
 
     return {
         "actions": actions,
         "source_routes": routes,
+        "sequence_start_routes": sequence_start_routes,
     }
 
 
@@ -1570,33 +1461,51 @@ def build_routes(
     if routes is None:
         return None
 
+    def resolve_route(route: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if route is None:
+            return None
+
+        edge_ids: List[str] = []
+        reachable = bool(route.get("reachable", False))
+        if reachable:
+            for edge in route.get("edges", []):
+                edge_id = path_ids.get(edge_signature(edge))
+                if edge_id is None:
+                    reachable = False
+                    edge_ids = []
+                    break
+                edge_ids.append(edge_id)
+
+        target = route.get("target") or {}
+        target_frame = route.get("target_frame", target.get("frame", 0))
+        return {
+            "reachable": reachable,
+            "target_id": route.get("target_id"),
+            "target_action": route.get("target_action", target.get("action")),
+            "target_animation": route.get("target_animation", target.get("animation")),
+            "target_frame": int(target_frame),
+            "total_cost": float(route.get("total_cost", 0.0)),
+            "total_frames": int(route.get("total_frames", 0)),
+            "num_transitions": int(route.get("num_transitions", 0)),
+            "edge_ids": edge_ids,
+        }
+
     source_routes: Dict[str, Dict[str, Any]] = {}
     for source_id, actions in routes["source_routes"].items():
         source_routes[source_id] = {}
         for action, route in actions.items():
-            edge_ids: List[str] = []
-            reachable = bool(route.get("reachable", False))
-            if reachable:
-                for edge in route.get("edges", []):
-                    edge_id = path_ids.get(edge_signature(edge))
-                    if edge_id is None:
-                        reachable = False
-                        edge_ids = []
-                        break
-                    edge_ids.append(edge_id)
+            source_routes[source_id][action] = resolve_route(route)
 
-            source_routes[source_id][action] = {
-                "reachable": reachable,
-                "target_id": route.get("target_id"),
-                "total_cost": float(route.get("total_cost", 0.0)),
-                "total_frames": int(route.get("total_frames", 0)),
-                "num_transitions": int(route.get("num_transitions", 0)),
-                "edge_ids": edge_ids,
-            }
+    sequence_start_routes = {
+        source_id: resolved
+        for source_id, route in routes.get("sequence_start_routes", {}).items()
+        if (resolved := resolve_route(route)) is not None
+    }
 
     return {
         "actions": list(routes["actions"]),
         "source_routes": source_routes,
+        "sequence_start_routes": sequence_start_routes,
     }
 
 
@@ -1689,7 +1598,7 @@ def render_page(
         f"edges={len(payload['edges'])}, transitions={len(payload.get('transitions', []))}"
     )
     if routes is None:
-        status = "Random walk is running. Build with --shortest-path to enable action routing."
+        status = "Random walk is running. Build with --shortest-path to enable action routing and return-to-start routing."
 
     return (
         HTML_TEMPLATE

@@ -78,6 +78,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="also export shortest path data",
     )
+    parser.add_argument(
+        "--path-length-weight",
+        type=float,
+        default=1.0,
+        help="weight for edge.length in shortest-path cost",
+    )
+    parser.add_argument(
+        "--path-distance-weight",
+        type=float,
+        default=1.0,
+        help="weight for edge.distance in shortest-path cost",
+    )
     return parser
 
 
@@ -113,7 +125,11 @@ def main() -> None:
     output_path = graph.save(Path(args.output))
     shortest_path_path = None
     if args.shortest_path:
-        shortest_path_path = graph.save_shortest_paths(output_path.parent)
+        shortest_path_path = graph.save_shortest_paths(
+            output_path.parent,
+            length_weight=args.path_length_weight,
+            distance_weight=args.path_distance_weight,
+        )
 
     print(
         f"Saved motion graph with {len(graph.nodes)} nodes and "

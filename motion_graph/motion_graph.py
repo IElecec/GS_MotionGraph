@@ -404,34 +404,87 @@ class MotionGraph:
             if not changed:
                 return current
 
-    def shortest_paths(self) -> Dict[str, Any]:
+    def shortest_paths(
+        self,
+        *,
+        length_weight: float = 1.0,
+        distance_weight: float = 1.0,
+    ) -> Dict[str, Any]:
         return all_shortest_paths(
             database_dir=str(self.database.base_dir),
             nodes=self.nodes,
             edges=self.edges,
+            length_weight=length_weight,
+            distance_weight=distance_weight,
         )
 
-    def save_shortest_paths(self, output_path: Path) -> Path:
-        return save_shortest_paths(self.shortest_paths(), output_path)
+    def save_shortest_paths(
+        self,
+        output_path: Path,
+        *,
+        length_weight: float = 1.0,
+        distance_weight: float = 1.0,
+    ) -> Path:
+        return save_shortest_paths(
+            self.shortest_paths(length_weight=length_weight, distance_weight=distance_weight),
+            output_path,
+        )
 
-    def shortest_paths_to_action(self, target_action: str) -> Dict[str, Any]:
+    def shortest_paths_to_action(
+        self,
+        target_action: str,
+        *,
+        length_weight: float = 1.0,
+        distance_weight: float = 1.0,
+    ) -> Dict[str, Any]:
         return path_to_action(
             database_dir=str(self.database.base_dir),
             nodes=self.nodes,
             edges=self.edges,
             target_action=target_action,
+            length_weight=length_weight,
+            distance_weight=distance_weight,
         )
 
-    def save_shortest_paths_to_action(self, output_path: Path, target_action: str) -> Path:
+    def save_shortest_paths_to_action(
+        self,
+        output_path: Path,
+        target_action: str,
+        *,
+        length_weight: float = 1.0,
+        distance_weight: float = 1.0,
+    ) -> Path:
         if output_path.suffix == "":
             output_path = output_path / f"shortest_paths_to_{target_action}.json"
-        return save_shortest_paths(self.shortest_paths_to_action(target_action), output_path)
+        return save_shortest_paths(
+            self.shortest_paths_to_action(
+                target_action,
+                length_weight=length_weight,
+                distance_weight=distance_weight,
+            ),
+            output_path,
+        )
 
-    def shortest_paths_to_all_other_actions(self) -> Dict[str, Any]:
-        return self.shortest_paths()
+    def shortest_paths_to_all_other_actions(
+        self,
+        *,
+        length_weight: float = 1.0,
+        distance_weight: float = 1.0,
+    ) -> Dict[str, Any]:
+        return self.shortest_paths(length_weight=length_weight, distance_weight=distance_weight)
 
-    def save_shortest_paths_to_all_other_actions(self, output_path: Path) -> Path:
-        return self.save_shortest_paths(output_path)
+    def save_shortest_paths_to_all_other_actions(
+        self,
+        output_path: Path,
+        *,
+        length_weight: float = 1.0,
+        distance_weight: float = 1.0,
+    ) -> Path:
+        return self.save_shortest_paths(
+            output_path,
+            length_weight=length_weight,
+            distance_weight=distance_weight,
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {

@@ -2,14 +2,12 @@ import argparse
 from pathlib import Path
 from typing import List
 
-import cv2
 import numpy as np
 import torch
 from tqdm import tqdm
 
 from .camera import build_mini_cam, build_orbit_camera, parse_vector3
 from .frame_cache import GaussianFrameCache
-from .gaussian_renderer import render_official_gaussian_frame
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -17,7 +15,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Render a multi-view scan from a single Gaussian frame."
     )
     parser.add_argument("--frame-path", required=True, help="Direct path to a Gaussian PLY frame.")
-    parser.add_argument("--output-dir", required=True, help="Directory for the rendered scan images.")
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Directory for the rendered scan images. Required unless --print-only is set.",
+    )
     parser.add_argument("--width", type=int, default=960)
     parser.add_argument("--height", type=int, default=960)
     parser.add_argument("--fov-deg", type=float, default=50.0)
@@ -26,6 +28,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scan-step-azimuth", type=float, default=30.0)
     parser.add_argument("--scan-elevation-deg", type=float, default=10.0)
     parser.add_argument("--scan-distance-scale", type=float, default=3.0)
+    parser.add_argument(
+        "--print-camera-at-azimuth",
+        type=float,
+        action="append",
+        default=[],
+        help="Print the fixed camera args for the given azimuth in degrees. Repeatable.",
+    )
+    parser.add_argument(
+        "--print-only",
+        action="store_true",
+        help="Only print requested camera args without rendering scan images.",
+    )
     parser.add_argument("--background", default="1,1,1", help="Background RGB in [0,1], e.g. 1,1,1")
     parser.add_argument("--sh-degree", type=int, default=3, help="Gaussian SH degree used when loading PLY")
     return parser
@@ -55,6 +69,31 @@ def build_azimuths(start: float, end: float, step: float) -> List[float]:
     return azimuths
 
 
+def format_vector3(vector: np.ndarray) -> str:
+    return ", ".join(str(float(value)) for value in vector.tolist())
+
+
+def print_camera_args(
+    azimuth_deg: float,
+    center: np.ndarray,
+    extent: float,
+    args: argparse.Namespace,
+) -> None:
+    camera = build_orbit_camera(
+        center=center,
+        extent=extent,
+        width=args.width,
+        height=args.height,
+        fov_deg=args.fov_deg,
+        azimuth_deg=azimuth_deg,
+        elevation_deg=args.scan_elevation_deg,
+        distance_scale=args.scan_distance_scale,
+    )
+    print(f"azimuth={float(azimuth_deg):g}")
+    print(f'--camera-position "{format_vector3(camera.position)}"')
+    print(f'--camera-target "{format_vector3(camera.target)}"')
+
+
 def main() -> None:
     args = build_parser().parse_args()
 
@@ -62,12 +101,10 @@ def main() -> None:
     if not source_frame.exists():
         raise FileNotFoundError(f"Missing frame file: {source_frame}")
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not torch.cuda.is_available():
-        raise RuntimeError("diff_gaussian_rasterization requires CUDA, but no CUDA device is available.")
+    if args.output_dir is None and not args.print_only:
+        raise ValueError("--output-dir is required unless --print-only is set.")
+    if args.print_only and not args.print_camera_at_azimuth:
+        raise ValueError("--print-only requires at least one --print-camera-at-azimuth.")
 
     cache = GaussianFrameCache(max_size=1, sh_degree=args.sh_degree)
     gaussian = cache.get(source_frame)
@@ -76,6 +113,32 @@ def main() -> None:
     maxs = xyz.max(axis=0)
     center = ((mins + maxs) * 0.5).astype(np.float32)
     extent = float(max(np.max(maxs - mins), 1e-3))
+
+    if args.print_camera_at_azimuth:
+        for idx, azimuth_deg in enumerate(args.print_camera_at_azimuth):
+            if idx > 0:
+                print()
+            print_camera_args(
+                azimuth_deg=azimuth_deg,
+                center=center,
+                extent=extent,
+                args=args,
+            )
+
+    if args.print_only:
+        return
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    import cv2
+
+    from .gaussian_renderer import render_official_gaussian_frame
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if not torch.cuda.is_available():
+        raise RuntimeError("diff_gaussian_rasterization requires CUDA, but no CUDA device is available.")
+
     background_torch = parse_background_tensor(args.background, device=device)
     azimuths = build_azimuths(
         start=args.scan_start_azimuth,

@@ -87,7 +87,7 @@ def render_frame_image(
 def find_reference_frame(database: Database) -> Tuple[str, str, Path]:
     for action in database.get_actions():
         for animation in database.get_animations(action):
-            frames = database.get_frames(action, animation)
+            frames = database.get_render_frames(action, animation)
             if frames:
                 return action, animation, frames[0]
     raise RuntimeError("Database does not contain any Gaussian PLY frames.")
@@ -104,7 +104,7 @@ def render_normal_frames(
     manifest: Dict[str, str] = {}
     for action in database.get_actions():
         for animation in database.get_animations(action):
-            frames = database.get_frames(action, animation)
+            frames = database.get_render_frames(action, animation)
             desc = f"Rendering {action}/{animation}"
             for frame_idx, frame_path in enumerate(tqdm(frames, desc=desc, unit="frame")):
                 relative_output = Path("normal") / action / animation / f"frame_{frame_idx:04d}.png"

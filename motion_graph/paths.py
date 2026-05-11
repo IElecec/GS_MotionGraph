@@ -227,14 +227,10 @@ def path_to_sequence_start(
         key=lambda item: item.key(),
     )
 
-    def same_action_only(source: FrameRef, destination: FrameRef, edge: GraphEdge) -> bool:
-        return source.action == target.action and destination.action == target.action
-
     best, next_node, next_edge = _best_paths_to_targets(
         node_map=node_map,
         reverse=reverse,
         target_keys=[target_key],
-        edge_filter=same_action_only,
         length_weight=length_weight,
         distance_weight=distance_weight,
     )

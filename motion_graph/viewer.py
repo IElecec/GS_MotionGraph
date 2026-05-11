@@ -660,7 +660,7 @@ HTML_TEMPLATE = """<!doctype html>
             animation: route.target_animation || source.animation,
             startFrame: Number(route.target_frame) || 0,
           },
-          `Reached the end of ${source.animation}. Returning to frame ${route.target_frame} inside ${lockAction}.`
+          `Reached the end of ${source.animation}. Returning to frame ${route.target_frame} of ${route.target_animation} via the precomputed route.`
         );
         return routeQueue.shift() || null;
       }
@@ -751,7 +751,7 @@ HTML_TEMPLATE = """<!doctype html>
               routeTarget: action,
             },
             route.edge_ids.length > 0
-              ? `After the next ${action} node, returning to frame ${route.target_frame} of ${route.target_animation}.`
+              ? `After the next ${action} node, returning to frame ${route.target_frame} of ${route.target_animation} via the precomputed route.`
               : `The next ${action} node is already frame ${route.target_frame} of ${route.target_animation}.`
           );
           return;
@@ -912,7 +912,7 @@ HTML_TEMPLATE = """<!doctype html>
               if (completedRoute?.kind === "lock-return" || completedRoute?.kind === "same-action-return") {
                 setStatus(
                   lockEnabled
-                    ? `Returned to frame ${completedRoute.startFrame} of ${completedRoute.animation}. Continuing inside ${completedRoute.action}.`
+                    ? `Returned to frame ${completedRoute.startFrame} of ${completedRoute.animation}. Continuing constrained walk in ${completedRoute.action}.`
                     : `Returned to frame ${completedRoute.startFrame} of ${completedRoute.animation}. Random walk resumed.`
                 );
               } else {

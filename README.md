@@ -22,7 +22,7 @@ python compute_similarity.py -m "D:\Files\Data\char1\anim_base\char1" -o outputs
 ### 2. 构建 motion graph，并导出 shortest path
 
 ```bash
-python build_motion_graph.py -m "D:\Files\Data\char1\anim_base\char1" -s outputs/char1 -o outputs/char1/motion_graph.json --shortest-path --distance-threshold 0.5 --top-k-intra-sequence 6 --top-k-inter-animation 6 --top-k-inter-sequence 6
+python build_motion_graph.py -m "D:\Files\Data\char1\anim_base\char1" -s outputs/char1 -o outputs/char1/motion_graph.json --shortest-path --distance-threshold 0.5 --top-k-intra-sequence 6 --top-k-inter-animation 6 --top-k-inter-sequence 6 --path-length-weight 1.0 --path-distance-weight 3.0
 # --path-length-weight 1.0 --path-distance-weight 2.0
 ```
 
@@ -43,7 +43,7 @@ python build_motion_graph.py -m "D:\Files\Data\char1\anim_base\char1" -s outputs
 - `outputs/char1/motion_graph_after_prune.svg`
 - `outputs/char1/shortest_path.json`
 
-`shortest_path.json` 会被可视化页面用来驱动 `To <action>`、同 action 下回到常规序列起点，以及 `Stay Within Current Action` 到序列末尾后的回路选择。
+`shortest_path.json` 会被可视化页面用来驱动 `To <action>`、同 action 下回到常规序列起点，以及 `Stay Within Current Action` 到序列末尾后的回路选择。回到常规序列起点的这条预计算路径允许借道其他 action。
 `motion_graph_before_prune.svg` 是裁剪前的 motion graph 静态图片。
 `motion_graph_after_prune.svg` 是裁剪后的 motion graph 静态图片。
 

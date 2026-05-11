@@ -190,6 +190,66 @@ def _collect(
             _collect(neighbor, graph, seen, component)
 
 
+def _adjacency(
+    node_keys: Set[FrameKey],
+    edges: List[GraphEdge],
+) -> Tuple[Dict[FrameKey, List[FrameKey]], Dict[FrameKey, List[FrameKey]]]:
+    graph: Dict[FrameKey, List[FrameKey]] = {key: [] for key in node_keys}
+    reverse: Dict[FrameKey, List[FrameKey]] = {key: [] for key in node_keys}
+
+    for edge in edges:
+        source = edge.source.key()
+        target = edge.target.key()
+        if source not in node_keys or target not in node_keys:
+            continue
+        graph[source].append(target)
+        reverse[target].append(source)
+
+    return graph, reverse
+
+
+def _strongly_connected_components(
+    nodes: List[FrameRef],
+    edges: List[GraphEdge],
+) -> List[List[FrameKey]]:
+    node_keys = sorted({node.key() for node in nodes})
+    if not node_keys:
+        return []
+
+    graph, reverse = _adjacency(set(node_keys), edges)
+
+    seen: Set[FrameKey] = set()
+    order: List[FrameKey] = []
+    for key in node_keys:
+        if key not in seen:
+            _finish_order(key, graph, seen, order)
+
+    seen.clear()
+    components: List[List[FrameKey]] = []
+    for key in reversed(order):
+        if key in seen:
+            continue
+        component: List[FrameKey] = []
+        _collect(key, reverse, seen, component)
+        components.append(component)
+
+    return components
+
+
+def _largest_component_keys(
+    nodes: List[FrameRef],
+    edges: List[GraphEdge],
+) -> Set[FrameKey]:
+    components = _strongly_connected_components(nodes, edges)
+    if not components:
+        return set()
+    largest = min(
+        components,
+        key=lambda component: (-len(component), tuple(sorted(component))),
+    )
+    return set(largest)
+
+
 @dataclass
 class MotionGraph:
     database: Database
@@ -205,7 +265,9 @@ class MotionGraph:
         database: Database,
         similarity_dir: Path,
         distance_threshold: float,
-        top_k: int,
+        top_k_intra_sequence: int,
+        top_k_inter_animation: int,
+        top_k_inter_sequence: int,
         prune_dead_ends: bool = True,
     ) -> "MotionGraph":
         root = _similarity_dir(similarity_dir)
@@ -230,6 +292,12 @@ class MotionGraph:
 
             source_mode = payload.get("source_index_mode", "window_start")
             target_mode = payload.get("target_index_mode", _target_mode(distance_matrix, window_size))
+            if src_action == dst_action and src_anim == dst_anim:
+                top_k = top_k_intra_sequence
+            elif src_action == dst_action:
+                top_k = top_k_inter_animation
+            else:
+                top_k = top_k_inter_sequence
 
             pair = build_transitions_from_matrices(
                 source_action=src_action,
@@ -278,42 +346,18 @@ class MotionGraph:
         )
         return graph.largest_strongly_connected_component() if prune_dead_ends else graph
 
-    def largest_strongly_connected_component(self) -> "MotionGraph":
-        graph: Dict[FrameKey, List[FrameKey]] = {node.key(): [] for node in self.nodes}
-        reverse: Dict[FrameKey, List[FrameKey]] = {node.key(): [] for node in self.nodes}
+    def _default_transition_length(self) -> int:
+        return max(0, int(self.window_size) - 1) if self.window_size is not None else 0
 
-        for edge in self.edges:
-            source = edge.source.key()
-            target = edge.target.key()
-            graph.setdefault(source, []).append(target)
-            reverse.setdefault(target, []).append(source)
-
-        seen: Set[FrameKey] = set()
-        order: List[FrameKey] = []
-        for key in graph:
-            if key not in seen:
-                _finish_order(key, graph, seen, order)
-
-        seen.clear()
-        largest: List[FrameKey] = []
-        for key in reversed(order):
-            if key in seen:
-                continue
-            component: List[FrameKey] = []
-            _collect(key, reverse, seen, component)
-            if len(component) > len(largest):
-                largest = component
-
-        keep = set(largest)
+    def _with_kept_nodes(self, keep: Set[FrameKey]) -> "MotionGraph":
         transitions = [
             transition
             for transition in self.transitions
             if transition.source.key() in keep and transition.target.key() in keep
         ]
-        default_length = max(0, int(self.window_size) - 1) if self.window_size is not None else 0
         nodes, edges, transitions = _rebuild(
             transitions,
-            default_length=default_length,
+            default_length=self._default_transition_length(),
             length_map=_transition_length_map(self.edges),
         )
         return MotionGraph(
@@ -323,6 +367,42 @@ class MotionGraph:
             transitions=transitions,
             window_size=self.window_size,
         )
+
+    def _largest_per_action_component_keys(self) -> Set[FrameKey]:
+        keep: Set[FrameKey] = set()
+        for action in sorted({node.action for node in self.nodes}):
+            action_nodes = [node for node in self.nodes if node.action == action]
+            action_edges = [
+                edge
+                for edge in self.edges
+                if edge.source.action == action and edge.target.action == action
+            ]
+            keep.update(_largest_component_keys(action_nodes, action_edges))
+        return keep
+
+    def largest_strongly_connected_component(self) -> "MotionGraph":
+        current = self
+        while True:
+            changed = False
+            current_keys = {node.key() for node in current.nodes}
+
+            global_keep = _largest_component_keys(current.nodes, current.edges)
+            if not global_keep:
+                return current
+            if global_keep != current_keys:
+                current = current._with_kept_nodes(global_keep)
+                changed = True
+                current_keys = {node.key() for node in current.nodes}
+
+            action_keep = current._largest_per_action_component_keys()
+            if not action_keep:
+                return current
+            if action_keep != current_keys:
+                current = current._with_kept_nodes(action_keep)
+                changed = True
+
+            if not changed:
+                return current
 
     def shortest_paths(self) -> Dict[str, Any]:
         return all_shortest_paths(

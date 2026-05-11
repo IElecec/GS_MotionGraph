@@ -19,6 +19,58 @@ NODE_RADIUS = 7
 EDGE_START_PAD = NODE_RADIUS + 2
 EDGE_END_PAD = NODE_RADIUS + 2
 
+SVG_IMAGE_STYLE = """
+<style>
+  svg {
+    background: #f5efe4;
+  }
+  text {
+    font-family: Georgia, "Times New Roman", serif;
+  }
+  .cluster-box {
+    fill: #f8f0e6;
+    stroke: #d8c7b1;
+    stroke-width: 1.3;
+  }
+  .cluster-title {
+    fill: #1b1b1b;
+    font-size: 19px;
+    font-weight: 600;
+  }
+  .cluster-meta {
+    fill: #7b7265;
+    font-size: 11px;
+  }
+  .lane-line {
+    stroke: #decfbc;
+    stroke-width: 1;
+    stroke-dasharray: 4 6;
+  }
+  .lane-label {
+    fill: #7b7265;
+    font-size: 11px;
+  }
+  .edge {
+    fill: none;
+    stroke-width: 2.2;
+    opacity: 0.74;
+  }
+  .edge-sequence { stroke: #5f8f9b; }
+  .edge-bridge { stroke: #d56a3a; }
+  .edge-jump { stroke: #aa4058; opacity: 0.56; }
+  .node {
+    fill: #164e59;
+    stroke: #fff7e9;
+    stroke-width: 1.2;
+  }
+  .node-label {
+    fill: #7b7265;
+    font-size: 9px;
+    text-anchor: middle;
+  }
+</style>
+""".strip()
+
 HTML_TEMPLATE = """<!doctype html>
 <html lang="en">
 <head>
@@ -170,6 +222,11 @@ HTML_TEMPLATE = """<!doctype html>
       align-items: start;
       margin-top: 16px;
     }
+    .preview-strip {
+      display: grid;
+      gap: 18px;
+      align-items: start;
+    }
     .card {
       border: 1px solid var(--border);
       border-radius: 20px;
@@ -178,33 +235,25 @@ HTML_TEMPLATE = """<!doctype html>
     }
     .preview {
       padding: 16px;
-      position: sticky;
-      top: 196px;
+      min-width: 0;
     }
     .preview h2,
     .graph h2 {
       margin: 0 0 12px 0;
       font-size: 18px;
     }
-    .preview-frame {
-      width: 100%;
-      display: block;
+    .preview-stage {
+      min-height: 420px;
       border-radius: 16px;
       border: 1px solid var(--border);
       background: #efe5d8;
+      overflow: hidden;
+    }
+    .preview-frame {
+      width: 100%;
+      display: block;
       min-height: 420px;
       object-fit: contain;
-    }
-    .preview-empty {
-      display: grid;
-      place-items: center;
-      min-height: 420px;
-      border-radius: 16px;
-      border: 1px dashed var(--border);
-      background: #faf3e9;
-      color: var(--muted);
-      text-align: center;
-      padding: 20px;
     }
     .preview-caption {
       margin-top: 10px;
@@ -295,8 +344,8 @@ HTML_TEMPLATE = """<!doctype html>
       .content {
         grid-template-columns: 1fr;
       }
-      .preview {
-        position: static;
+      .preview-strip {
+        grid-template-columns: 1fr !important;
       }
       .speed {
         margin-left: 0;
@@ -346,9 +395,17 @@ HTML_TEMPLATE = """<!doctype html>
     const data = __DATA__;
 
     const walker = document.getElementById("walker");
-    const previewImage = document.getElementById("preview-image");
-    const previewEmpty = document.getElementById("preview-empty");
-    const previewCaption = document.getElementById("preview-caption");
+    const previewPanels = Array.from(document.querySelectorAll("[data-preview-index]")).map((panel) => {
+      const image = panel.querySelector(".preview-frame");
+      const caption = panel.querySelector(".preview-caption");
+      return {
+        index: Number(panel.dataset.previewIndex || 0),
+        image,
+        caption,
+        shownPath: null,
+        wantedPath: null,
+      };
+    });
     const actionButtons = document.getElementById("action-buttons");
     const status = document.getElementById("status");
     const lockButton = document.getElementById("lock-button");
@@ -362,16 +419,34 @@ HTML_TEMPLATE = """<!doctype html>
       let edgeStart = 0;
       let edgeLength = 1;
       let edgeDuration = 1000 / fps;
-      let shownImage = null;
-      let wantedImage = null;
       let activePath = null;
       let walkMode = "random";
+      let guidedRoute = null;
       let routeTarget = null;
       let routeQueue = [];
       let lockEnabled = false;
       let lockAction = null;
+      const assetNonce = String(Date.now());
       const imageCache = new Map();
       const edgesByAction = {};
+      const incoming = {};
+      const laneStarts = {};
+      const returnRouteCache = new Map();
+
+      Object.entries(data.nodes).forEach(([nodeId, node]) => {
+        const laneId = `${node.action}|${node.animation}`;
+        const current = laneStarts[laneId];
+        if (!current || Number(node.frame) < Number(current.frame)) {
+          laneStarts[laneId] = { nodeId, frame: Number(node.frame) };
+        }
+      });
+
+      Object.entries(data.edges).forEach(([edgeId, edge]) => {
+        if (!incoming[edge.target]) {
+          incoming[edge.target] = [];
+        }
+        incoming[edge.target].push(edgeId);
+      });
 
       function setStatus(text) {
         if (status) {
@@ -412,8 +487,20 @@ HTML_TEMPLATE = """<!doctype html>
         return edge ? edge.target : null;
       }
 
+      function laneIdForNode(nodeId) {
+        const info = nodeInfo(nodeId);
+        return info ? `${info.action}|${info.animation}` : null;
+      }
+
       function pick(list) {
         return list[Math.floor(Math.random() * list.length)];
+      }
+
+      function assetUrl(path) {
+        if (!path) {
+          return path;
+        }
+        return path.includes("?") ? `${path}&v=${assetNonce}` : `${path}?v=${assetNonce}`;
       }
 
       function preload(path) {
@@ -429,79 +516,79 @@ HTML_TEMPLATE = """<!doctype html>
         record = { image: img, ready: false };
         img.onload = () => {
           record.ready = true;
-          if (wantedImage === path) {
-            showPreview(path);
-          }
+          previewPanels.forEach((panel) => {
+            if (panel.wantedPath === path) {
+              showPreview(panel, path);
+            }
+          });
         };
-        img.src = path;
+        img.src = assetUrl(path);
         imageCache.set(path, record);
         return record;
       }
 
-      function showPreview(path) {
-        if (!previewImage || !previewEmpty || !path) {
+      function showPreview(panel, path) {
+        if (!panel.image || !path) {
           return;
         }
-        if (shownImage !== path) {
-          previewImage.src = path;
-          shownImage = path;
+        if (panel.shownPath !== path) {
+          panel.image.src = assetUrl(path);
+          panel.shownPath = path;
         }
-        previewImage.hidden = false;
-        previewEmpty.hidden = true;
+        panel.image.hidden = false;
       }
 
-      function edgeImages(edgeId) {
+      function edgeImages(edgeId, previewIndex) {
         const edge = data.edges[edgeId];
-        return edge ? edge.image_paths || [] : [];
+        return edge ? (edge.image_path_sets?.[previewIndex] || []) : [];
       }
 
       function warmEdge(edgeId) {
-        edgeImages(edgeId).forEach((path) => preload(path));
+        previewPanels.forEach((panel) => {
+          edgeImages(edgeId, panel.index).forEach((path) => preload(path));
+        });
       }
 
       function warmOutgoing(nodeId, limit = 6) {
         (data.outgoing[nodeId] || []).slice(0, limit).forEach((edgeId) => warmEdge(edgeId));
       }
 
-      function previewPath(progress) {
+      function previewPath(progress, previewIndex) {
         const edge = data.edges[currentEdgeId];
         if (!edge) {
           return null;
         }
-        const paths = edge.image_paths || [];
+        const paths = edge.image_path_sets?.[previewIndex] || [];
         if (paths.length > 0) {
           const index = Math.min(paths.length - 1, Math.floor(progress * paths.length));
           return paths[index];
         }
         const target = nodeInfo(edge.target);
-        return target ? target.image_path : null;
+        return target ? (target.image_paths?.[previewIndex] || null) : null;
       }
 
       function updatePreview(progress) {
-        if (!previewCaption) {
-          return;
-        }
         const edge = data.edges[currentEdgeId];
-        const path = previewPath(progress);
-        previewCaption.textContent = edge ? edge.label : "";
+        previewPanels.forEach((panel) => {
+          const path = previewPath(progress, panel.index);
+          if (panel.caption) {
+            panel.caption.textContent = edge ? edge.label : "";
+          }
 
-        if (!previewImage || !previewEmpty) {
-          return;
-        }
-        if (!path) {
-          previewImage.hidden = true;
-          previewEmpty.hidden = false;
-          return;
-        }
-        wantedImage = path;
-        const record = preload(path);
-        if (record && record.ready) {
-          showPreview(path);
-        } else if (!shownImage) {
-          previewImage.hidden = true;
-          previewEmpty.hidden = false;
-          previewEmpty.textContent = "Loading frame preview...";
-        }
+          if (!panel.image) {
+            return;
+          }
+          if (!path) {
+            panel.wantedPath = null;
+            panel.image.hidden = true;
+            return;
+          }
+          panel.wantedPath = path;
+          const record = preload(path);
+          if (record && record.ready) {
+            showPreview(panel, path);
+          }
+        });
       }
 
       function actionEdgePool(action) {
@@ -514,18 +601,214 @@ HTML_TEMPLATE = """<!doctype html>
         return edgesByAction[action];
       }
 
+      function preferNonTransition(edgeIds) {
+        const preferred = edgeIds.filter((edgeId) => {
+          const edge = data.edges[edgeId];
+          return edge && edge.kind !== "transition";
+        });
+        return preferred.length > 0 ? preferred : edgeIds;
+      }
+
+      function localActionEdges(fromNodeId, action) {
+        return (data.outgoing[fromNodeId] || []).filter((edgeId) => {
+          const edge = data.edges[edgeId];
+          return edge && nodeAction(edge.source) === action && nodeAction(edge.target) === action;
+        });
+      }
+
+      function forwardSequenceEdges(fromNodeId) {
+        const source = nodeInfo(fromNodeId);
+        if (!source) {
+          return [];
+        }
+        return (data.outgoing[fromNodeId] || []).filter((edgeId) => {
+          const edge = data.edges[edgeId];
+          const target = edge ? nodeInfo(edge.target) : null;
+          return (
+            edge &&
+            edge.kind === "sequence" &&
+            target &&
+            source.action === target.action &&
+            source.animation === target.animation &&
+            Number(target.frame) >= Number(source.frame)
+          );
+        });
+      }
+
+      function comparePathState(left, right) {
+        for (let index = 0; index < left.length; index += 1) {
+          if (left[index] < right[index]) {
+            return -1;
+          }
+          if (left[index] > right[index]) {
+            return 1;
+          }
+        }
+        return 0;
+      }
+
+      function betterPathState(candidate, current) {
+        return !current || comparePathState(candidate, current) < 0;
+      }
+
+      function edgeCost(edge) {
+        return Math.max(0, Number(edge?.length) || 0) + (Number(edge?.distance) || 0);
+      }
+
+      function shortestPathWithinAction(sourceNodeId, targetNodeId, action) {
+        const cacheKey = `${sourceNodeId}->${targetNodeId}`;
+        const cached = returnRouteCache.get(cacheKey);
+        if (cached) {
+          return cached;
+        }
+        if (!sourceNodeId || !targetNodeId || sourceNodeId === targetNodeId) {
+          const direct = {
+            reachable: sourceNodeId === targetNodeId,
+            edge_ids: [],
+            total_cost: 0,
+            total_frames: 0,
+            total_transition_distance: 0,
+            num_transitions: 0,
+          };
+          returnRouteCache.set(cacheKey, direct);
+          return direct;
+        }
+
+        const best = new Map([[targetNodeId, [0, 0, 0, 0]]]);
+        const nextEdge = new Map();
+        const nextNode = new Map();
+        const heap = [{ nodeId: targetNodeId, state: [0, 0, 0, 0] }];
+
+        while (heap.length > 0) {
+          heap.sort((left, right) => comparePathState(left.state, right.state));
+          const current = heap.shift();
+          const currentBest = best.get(current.nodeId);
+          if (!currentBest || comparePathState(current.state, currentBest) !== 0) {
+            continue;
+          }
+
+          (incoming[current.nodeId] || []).forEach((edgeId) => {
+            const edge = data.edges[edgeId];
+            if (!edge) {
+              return;
+            }
+            const source = nodeInfo(edge.source);
+            const target = nodeInfo(edge.target);
+            if (!source || !target || source.action !== action || target.action !== action) {
+              return;
+            }
+
+            const candidate = [
+              current.state[0] + edgeCost(edge),
+              current.state[1] + Math.max(0, Number(edge.length) || 0),
+              current.state[2] + (Number(edge.distance) || 0),
+              current.state[3] + (edge.kind === "transition" ? 1 : 0),
+            ];
+            if (!betterPathState(candidate, best.get(edge.source))) {
+              return;
+            }
+            best.set(edge.source, candidate);
+            nextEdge.set(edge.source, edgeId);
+            nextNode.set(edge.source, current.nodeId);
+            heap.push({ nodeId: edge.source, state: candidate });
+          });
+        }
+
+        const state = best.get(sourceNodeId);
+        if (!state) {
+          const missing = {
+            reachable: false,
+            edge_ids: [],
+            total_cost: 0,
+            total_frames: 0,
+            total_transition_distance: 0,
+            num_transitions: 0,
+          };
+          returnRouteCache.set(cacheKey, missing);
+          return missing;
+        }
+
+        const edgeIds = [];
+        let cursor = sourceNodeId;
+        while (cursor !== targetNodeId) {
+          const edgeId = nextEdge.get(cursor);
+          const nextId = nextNode.get(cursor);
+          if (!edgeId || !nextId) {
+            const broken = {
+              reachable: false,
+              edge_ids: [],
+              total_cost: 0,
+              total_frames: 0,
+              total_transition_distance: 0,
+              num_transitions: 0,
+            };
+            returnRouteCache.set(cacheKey, broken);
+            return broken;
+          }
+          edgeIds.push(edgeId);
+          cursor = nextId;
+        }
+
+        const route = {
+          reachable: true,
+          edge_ids: edgeIds,
+          total_cost: Number(state[0]) || 0,
+          total_frames: Number(state[1]) || 0,
+          total_transition_distance: Number(state[2]) || 0,
+          num_transitions: Number(state[3]) || 0,
+        };
+        returnRouteCache.set(cacheKey, route);
+        return route;
+      }
+
+      function maybeStartLockReturnRoute(fromNodeId) {
+        if (!lockEnabled || !lockAction) {
+          return null;
+        }
+        const source = nodeInfo(fromNodeId);
+        const laneId = laneIdForNode(fromNodeId);
+        const laneStart = laneId ? laneStarts[laneId] : null;
+        if (!source || source.action !== lockAction || !laneStart || laneStart.nodeId === fromNodeId) {
+          return null;
+        }
+        const route = shortestPathWithinAction(fromNodeId, laneStart.nodeId, lockAction);
+        if (!route.reachable || !route.edge_ids.length) {
+          return null;
+        }
+
+        guidedRoute = {
+          kind: "lock-return",
+          action: lockAction,
+          animation: source.animation,
+          targetNodeId: laneStart.nodeId,
+          startFrame: laneStart.frame,
+        };
+        routeTarget = null;
+        routeQueue = [...route.edge_ids];
+        walkMode = "guided";
+        routeQueue.forEach((edgeId) => warmEdge(edgeId));
+        setStatus(`Reached the end of ${source.animation}. Returning to frame ${laneStart.frame} inside ${lockAction}.`);
+        refreshActionButtons();
+        return routeQueue.shift() || null;
+      }
+
       function nextRandomEdge(fromNodeId) {
         if (lockEnabled && lockAction) {
-          const local = (data.outgoing[fromNodeId] || []).filter((edgeId) => {
-            const edge = data.edges[edgeId];
-            return edge && nodeAction(edge.source) === lockAction && nodeAction(edge.target) === lockAction;
-          });
+          const sequence = forwardSequenceEdges(fromNodeId);
+          if (sequence.length > 0) {
+            return pick(sequence);
+          }
+          const returnEdge = maybeStartLockReturnRoute(fromNodeId);
+          if (returnEdge) {
+            return returnEdge;
+          }
+          const local = localActionEdges(fromNodeId, lockAction);
           if (local.length > 0) {
-            return pick(local);
+            return pick(preferNonTransition(local));
           }
           const fallback = actionEdgePool(lockAction);
           if (fallback.length > 0) {
-            return pick(fallback);
+            return pick(preferNonTransition(fallback));
           }
         }
         const outgoing = data.outgoing[fromNodeId];
@@ -582,6 +865,29 @@ HTML_TEMPLATE = """<!doctype html>
         updateLockButton();
       }
 
+      function routeToAction(action) {
+        const route = currentRoute(action);
+        if (!route || !route.reachable) {
+          setStatus(`No route from the current node to ${action}.`);
+          refreshActionButtons();
+          return;
+        }
+        guidedRoute = {
+          kind: "action",
+          action,
+        };
+        routeTarget = action;
+        routeQueue = Array.isArray(route.edge_ids) ? [...route.edge_ids] : [];
+        walkMode = "guided";
+        routeQueue.forEach((edgeId) => warmEdge(edgeId));
+        if (routeQueue.length > 0) {
+          setStatus(`Following shortest path to ${action}.`);
+        } else {
+          setStatus(`Already entering ${action}. Random walk will resume after this edge.`);
+        }
+        refreshActionButtons();
+      }
+
       function buildActionButtons() {
         if (!actionButtons) {
           return;
@@ -592,33 +898,67 @@ HTML_TEMPLATE = """<!doctype html>
         }
 
         actionButtons.innerHTML = "";
-        data.routes.actions.forEach((action) => {
+        data.routes.actions.forEach((action, index) => {
           const button = document.createElement("button");
           button.type = "button";
           button.className = "button";
           button.dataset.action = action;
-          button.textContent = `To ${action}`;
+          const hotkey = index < 9 ? `${index + 1}. ` : "";
+          button.textContent = `${hotkey}To ${action}`;
           button.addEventListener("click", () => {
-            const route = currentRoute(action);
-            if (!route || !route.reachable) {
-              setStatus(`No route from the current node to ${action}.`);
-              refreshActionButtons();
-              return;
-            }
-            routeTarget = action;
-            routeQueue = Array.isArray(route.edge_ids) ? [...route.edge_ids] : [];
-            walkMode = "guided";
-            routeQueue.forEach((edgeId) => warmEdge(edgeId));
-            if (routeQueue.length > 0) {
-              setStatus(`Following shortest path to ${action}.`);
-            } else {
-              setStatus(`Already entering ${action}. Random walk will resume after this edge.`);
-            }
-            refreshActionButtons();
+            routeToAction(action);
           });
           actionButtons.appendChild(button);
         });
         refreshActionButtons();
+      }
+
+      function isEditableTarget(target) {
+        if (!target || !(target instanceof Element)) {
+          return false;
+        }
+        if (target.isContentEditable) {
+          return true;
+        }
+        const tagName = target.tagName;
+        if (tagName === "TEXTAREA" || tagName === "SELECT") {
+          return true;
+        }
+        if (tagName !== "INPUT") {
+          return false;
+        }
+        const inputType = String(target.getAttribute("type") || "text").toLowerCase();
+        return [
+          "text",
+          "search",
+          "url",
+          "tel",
+          "password",
+          "email",
+          "number",
+        ].includes(inputType);
+      }
+
+      function handleHotkey(event) {
+        if (!data.routes || !Array.isArray(data.routes.actions) || !data.routes.actions.length) {
+          return;
+        }
+        if (event.defaultPrevented || event.repeat || event.altKey || event.ctrlKey || event.metaKey) {
+          return;
+        }
+        if (isEditableTarget(event.target)) {
+          return;
+        }
+        if (!/^[1-9]$/.test(event.key)) {
+          return;
+        }
+        const index = Number(event.key) - 1;
+        const action = data.routes.actions[index];
+        if (!action) {
+          return;
+        }
+        event.preventDefault();
+        routeToAction(action);
       }
 
       function toggleLock() {
@@ -679,17 +1019,27 @@ HTML_TEMPLATE = """<!doctype html>
             if (routeQueue.length > 0) {
               activate(routeQueue.shift(), now);
             } else {
+              const completedRoute = guidedRoute;
               const reached = routeTarget;
               walkMode = "random";
+              guidedRoute = null;
               routeTarget = null;
-              if (lockEnabled) {
+              if (lockEnabled && completedRoute?.kind === "action") {
                 lockAction = reached || nodeAction(edge.target) || lockAction;
               }
-              setStatus(
-                lockEnabled && lockAction
-                  ? `Arrived at ${reached}. Continuing inside ${lockAction}.`
-                  : `Arrived at ${reached}. Random walk resumed.`
-              );
+              if (completedRoute?.kind === "lock-return") {
+                setStatus(
+                  lockEnabled
+                    ? `Returned to frame ${completedRoute.startFrame} of ${completedRoute.animation}. Continuing inside ${completedRoute.action}.`
+                    : `Returned to frame ${completedRoute.startFrame} of ${completedRoute.animation}. Random walk resumed.`
+                );
+              } else {
+                setStatus(
+                  lockEnabled && lockAction
+                    ? `Arrived at ${reached}. Continuing inside ${lockAction}.`
+                    : `Arrived at ${reached}. Random walk resumed.`
+                );
+              }
               activate(nextRandomEdge(edge.target), now);
             }
           } else {
@@ -709,6 +1059,7 @@ HTML_TEMPLATE = """<!doctype html>
       if (speedSlider) {
         speedSlider.addEventListener("input", (event) => setSpeed(event.target.value));
       }
+      document.addEventListener("keydown", handleHotkey);
       buildActionButtons();
       setSpeed(data.fps);
       if (!status.textContent) {
@@ -822,21 +1173,20 @@ def register_asset(
     return f"/assets/{asset_id}"
 
 
-def load_images(
+def load_image_library(
     graph_path: Path,
-    manifest_path: Optional[Path],
+    manifest_path: Path,
+    files: Dict[str, Path],
+    ids: Dict[str, str],
+    index: int,
     required: bool,
 ) -> Optional[Dict[str, Any]]:
-    if manifest_path is None:
-        manifest_path = graph_path.parent / "rendered_images" / "manifest.json"
     if not manifest_path.exists():
         if required:
             raise FileNotFoundError(f"Image manifest not found: {manifest_path}")
         return None
 
     raw = load_json(manifest_path)
-    files: Dict[str, Path] = {}
-    ids: Dict[str, str] = {}
     normal: Dict[str, str] = {}
     transitions: Dict[str, List[str]] = {}
 
@@ -852,10 +1202,46 @@ def load_images(
             if url:
                 transitions[folder].append(url)
 
+    label = str(raw.get("label") or manifest_path.parent.name or f"View {index + 1}")
     return {
-        "files": files,
+        "label": label,
         "normal": normal,
         "transitions": transitions,
+    }
+
+
+def load_images(
+    graph_path: Path,
+    manifest_paths: Optional[List[Path]],
+    required: bool,
+) -> Optional[Dict[str, Any]]:
+    if not manifest_paths:
+        manifest_paths = [graph_path.parent / "rendered_images" / "manifest.json"]
+
+    files: Dict[str, Path] = {}
+    ids: Dict[str, str] = {}
+    libraries: List[Dict[str, Any]] = []
+
+    for index, manifest_path in enumerate(manifest_paths):
+        library = load_image_library(
+            graph_path=graph_path,
+            manifest_path=manifest_path,
+            files=files,
+            ids=ids,
+            index=index,
+            required=required,
+        )
+        if library is not None:
+            libraries.append(library)
+
+    if required and not libraries:
+        raise FileNotFoundError("No image manifests could be loaded.")
+    if not libraries:
+        return None
+
+    return {
+        "files": files,
+        "libraries": libraries,
     }
 
 
@@ -1015,11 +1401,17 @@ def line_path(source: Tuple[float, float], target: Tuple[float, float]) -> str:
     return f"M {x1:.2f} {y1:.2f} L {x2:.2f} {y2:.2f}"
 
 
-def curve_path(source: Tuple[float, float], target: Tuple[float, float], lift: float) -> str:
+def curve_path(
+    source: Tuple[float, float],
+    target: Tuple[float, float],
+    lift: float,
+    *,
+    upward: bool = True,
+) -> str:
     x1, y1 = source
     x2, y2 = target
     cx = (x1 + x2) / 2
-    cy = min(y1, y2) - lift
+    cy = min(y1, y2) - lift if upward else max(y1, y2) + lift
     x1, y1, x2, y2 = trim_quadratic(
         x1,
         y1,
@@ -1071,7 +1463,14 @@ def render_svg(payload: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
             css = "edge edge-sequence"
             marker = "arrow-sequence"
         elif edge["source"]["action"] == edge["target"]["action"]:
-            path_d = curve_path(source, target, 34 + abs(target[0] - source[0]) * 0.18)
+            source_frame = int(edge["source"]["frame"])
+            target_frame = int(edge["target"]["frame"])
+            path_d = curve_path(
+                source,
+                target,
+                34 + abs(target[0] - source[0]) * 0.18,
+                upward=target_frame >= source_frame,
+            )
             css = "edge edge-bridge"
             marker = "arrow-bridge"
         else:
@@ -1112,6 +1511,21 @@ def render_svg(payload: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
         + "</svg>"
     )
     return svg, path_ids
+
+
+def render_svg_image(payload: Dict[str, Any]) -> str:
+    svg, _ = render_svg(payload)
+    return svg.replace(
+        ">",
+        f">{SVG_IMAGE_STYLE}<rect x=\"0\" y=\"0\" width=\"100%\" height=\"100%\" fill=\"#f5efe4\"></rect>",
+        1,
+    )
+
+
+def save_graph_svg(payload: Dict[str, Any], output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(render_svg_image(payload), encoding="utf-8")
+    return output_path
 
 
 def frame_key(action: str, animation: str, frame: int) -> str:
@@ -1196,15 +1610,17 @@ def build_data(
     edges: Dict[str, Any] = {}
     outgoing: Dict[str, List[str]] = {}
     nodes: Dict[str, Any] = {}
+    libraries = [] if images is None else images.get("libraries", [])
 
     for node in payload["nodes"]:
         nodes[node_id(node)] = {
             "action": node["action"],
             "animation": node["animation"],
             "frame": int(node["frame"]),
-            "image_path": None if images is None else images["normal"].get(
-                frame_key(node["action"], node["animation"], int(node["frame"]))
-            ),
+            "image_paths": [
+                library["normal"].get(frame_key(node["action"], node["animation"], int(node["frame"])))
+                for library in libraries
+            ],
         }
 
     edge_ids: List[str] = []
@@ -1216,7 +1632,8 @@ def build_data(
             "target": node_id(edge["target"]),
             "kind": edge["kind"],
             "length": int(edge["length"]),
-            "image_paths": edge_images(edge, images),
+            "distance": float(edge.get("distance", 0.0)),
+            "image_path_sets": [edge_images(edge, library) for library in libraries],
             "label": f'{node_id(edge["source"])} -> {node_id(edge["target"])}',
         }
         outgoing.setdefault(node_id(edge["source"]), []).append(edge_id)
@@ -1245,15 +1662,27 @@ def render_page(
     content_columns = "minmax(0, 1fr)"
     status = "Random walk is running."
     if mode == "image":
-        content_columns = "minmax(420px, 520px) minmax(0, 1fr)"
-        preview_block = """
-      <div class="card preview">
-        <h2>Frame Preview</h2>
-        <img id="preview-image" class="preview-frame" alt="Walker preview" hidden>
-        <div id="preview-empty" class="preview-empty">The preview will start as soon as the walker enters an edge with rendered frames.</div>
-        <div id="preview-caption" class="preview-caption"></div>
+        libraries = [] if images is None else images.get("libraries", [])
+        columns = max(1, len(libraries))
+        cards: List[str] = []
+        for index, library in enumerate(libraries):
+            label = html.escape(str(library.get("label", f"View {index + 1}")))
+            cards.append(
+                f"""
+      <div class="card preview" data-preview-index="{index}">
+        <h2>{label}</h2>
+        <div class="preview-stage">
+          <img class="preview-frame" alt="{label} preview" hidden>
+        </div>
+        <div class="preview-caption"></div>
       </div>
-"""
+""".rstrip()
+            )
+        preview_block = (
+            f'<div class="preview-strip" style="grid-template-columns: repeat({columns}, minmax(0, 1fr));">'
+            + "".join(cards)
+            + "</div>"
+        )
 
     summary = html.escape(
         f"actions={len(group_actions(payload['nodes']))}, nodes={len(payload['nodes'])}, "
@@ -1300,29 +1729,35 @@ def create_app(
     *,
     graph_path: Path,
     mode: str = "graph",
-    image_manifest: Optional[Path] = None,
+    image_manifests: Optional[List[Path]] = None,
     fps: float = 24.0,
 ) -> Any:
-    from flask import Flask, abort, send_file
+    from flask import Flask, abort, make_response, send_file
 
     payload = load_graph(graph_path)
-    images = load_images(graph_path, image_manifest, required=mode == "image")
+    images = load_images(graph_path, image_manifests, required=mode == "image")
     routes = load_routes(graph_path)
     page = render_page(payload, images, routes, mode=mode, fps=fps)
     asset_files = {} if images is None else images["files"]
 
     app = Flask(__name__)
 
+    def disable_cache(response: Any) -> Any:
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+        return response
+
     @app.route("/")
-    def index() -> str:
-        return page
+    def index() -> Any:
+        return disable_cache(make_response(page))
 
     @app.route("/assets/<asset_id>")
     def asset(asset_id: str) -> Any:
         path = asset_files.get(asset_id)
         if path is None or not path.exists():
             abort(404)
-        return send_file(path, conditional=True, max_age=3600)
+        return disable_cache(send_file(path, conditional=False, max_age=0))
 
     return app
 
@@ -1333,7 +1768,7 @@ def serve(
     host: str = "127.0.0.1",
     port: int = 8765,
     mode: str = "graph",
-    image_manifest: Optional[Path] = None,
+    image_manifests: Optional[List[Path]] = None,
     fps: float = 24.0,
 ) -> None:
     error = port_error(host, port)
@@ -1347,7 +1782,7 @@ def serve(
     app = create_app(
         graph_path=graph_path.resolve(),
         mode=mode,
-        image_manifest=None if image_manifest is None else image_manifest.resolve(),
+        image_manifests=None if image_manifests is None else [path.resolve() for path in image_manifests],
         fps=fps,
     )
     visible_host = "127.0.0.1" if host == "0.0.0.0" else host

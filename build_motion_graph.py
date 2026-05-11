@@ -2,6 +2,20 @@ import argparse
 from pathlib import Path
 
 
+def resolved_graph_output(path: Path) -> Path:
+    return path / "motion_graph.json" if path.suffix == "" else path
+
+
+def pre_prune_image_output(path: Path) -> Path:
+    resolved = resolved_graph_output(path)
+    return resolved.with_name(f"{resolved.stem}_before_prune.svg")
+
+
+def post_prune_image_output(path: Path) -> Path:
+    resolved = resolved_graph_output(path)
+    return resolved.with_name(f"{resolved.stem}_after_prune.svg")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build a motion graph from a database and precomputed similarity matrices."
@@ -34,7 +48,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--top-k",
         type=int,
         default=5,
-        help="keep at most top-k local-minimum transitions for each animation pair; <= 0 keeps all",
+        help="default top-k for transition candidates; <= 0 keeps all",
+    )
+    parser.add_argument(
+        "--top-k-intra-sequence",
+        type=int,
+        default=None,
+        help="top-k for source/target from the same action and animation; defaults to --top-k",
+    )
+    parser.add_argument(
+        "--top-k-inter-animation",
+        type=int,
+        default=None,
+        help="top-k for source/target from the same action but different animations; defaults to --top-k-inter-sequence",
+    )
+    parser.add_argument(
+        "--top-k-inter-sequence",
+        type=int,
+        default=None,
+        help="default top-k for source/target from different sequences; defaults to --top-k",
     )
     parser.add_argument(
         "--keep-dead-ends",
@@ -54,15 +86,29 @@ def main() -> None:
     args = parser.parse_args()
 
     from motion_graph import MotionGraph
+    from motion_graph.viewer import save_graph_svg
     from utils import Database
 
     db = Database(Path(args.database))
-    graph = MotionGraph.build(
+    top_k_inter_sequence = args.top_k if args.top_k_inter_sequence is None else args.top_k_inter_sequence
+    top_k_inter_animation = top_k_inter_sequence if args.top_k_inter_animation is None else args.top_k_inter_animation
+    raw_graph = MotionGraph.build(
         database=db,
         similarity_dir=Path(args.similarity_dir),
         distance_threshold=args.distance_threshold,
-        top_k=args.top_k,
-        prune_dead_ends=not args.keep_dead_ends,
+        top_k_intra_sequence=args.top_k if args.top_k_intra_sequence is None else args.top_k_intra_sequence,
+        top_k_inter_animation=top_k_inter_animation,
+        top_k_inter_sequence=top_k_inter_sequence,
+        prune_dead_ends=False,
+    )
+    pre_prune_image_path = save_graph_svg(
+        raw_graph.to_dict(),
+        pre_prune_image_output(Path(args.output)),
+    )
+    graph = raw_graph if args.keep_dead_ends else raw_graph.largest_strongly_connected_component()
+    post_prune_image_path = save_graph_svg(
+        graph.to_dict(),
+        post_prune_image_output(Path(args.output)),
     )
     output_path = graph.save(Path(args.output))
     shortest_path_path = None
@@ -73,6 +119,8 @@ def main() -> None:
         f"Saved motion graph with {len(graph.nodes)} nodes and "
         f"{len(graph.edges)} edges to {output_path}"
     )
+    print(f"Saved pre-prune motion graph image at {pre_prune_image_path}")
+    print(f"Saved final motion graph image at {post_prune_image_path}")
     if shortest_path_path is not None:
         print(f"Saved shortest path data at {shortest_path_path}")
 

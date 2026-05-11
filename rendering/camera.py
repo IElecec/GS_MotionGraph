@@ -108,8 +108,9 @@ def build_world_to_view_lookat(
     up_hint = normalize(up_hint.astype(np.float32))
 
     forward = normalize(target - camera_position)
-    right = normalize(np.cross(forward, up_hint))
-    true_up = normalize(np.cross(right, forward))
+    # Match the renderer's camera handedness so the image is not mirrored.
+    right = normalize(np.cross(up_hint, forward))
+    true_up = normalize(np.cross(forward, right))
 
     if np.linalg.norm(right) < 1e-8 or np.linalg.norm(true_up) < 1e-8:
         raise ValueError("Invalid look-at camera configuration.")

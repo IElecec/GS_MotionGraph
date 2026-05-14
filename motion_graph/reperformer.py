@@ -206,6 +206,8 @@ class ReperformerSkinSynthesizer:
         self.gs_motion_unet.eval()
         self.gs_geo_unet.eval()
         self.gs_color_unet.eval()
+        self.gaussian = GaussianModel(self.sh_degree)
+        self.gaussian.active_sh_degree = self.sh_degree
 
     def _build_skin_to_joint_graph(
         self,
@@ -281,39 +283,35 @@ class ReperformerSkinSynthesizer:
         new_rotations = batch_rotmat2qvec_torch(torch.matmul(rot_out, raw_rot_matrix))
         return pos_out, new_rotations
 
-    def _warp_canonical_gaussian(
-        self,
-        rel_trans: torch.Tensor,
-    ) -> Tuple[GaussianModel, torch.Tensor, torch.Tensor]:
-        warped_pos, warped_rot = self._warp_morton_points(rel_trans)
-        gaussian = copy.deepcopy(self.gaussian_canonical)
-        gaussian._xyz = warped_pos.detach()
-        gaussian._rotation = warped_rot.detach()
-        return gaussian, warped_pos, warped_rot
+    def _forward_warpping(self, warped_pos: torch.Tensor) -> GaussianModel:
+        pos_map = self.pos_map.clone()
+        pos_map[self.non_empty_idx, self.non_empty_idy] = warped_pos.to(self.device)
+        pos_map = pos_map.unsqueeze(0).permute(0, 3, 1, 2)
+
+        pos = self._unprojection(pos_map).detach()
+        motion_map = self.gs_motion_unet(pos_map)
+        geo_map = self.gs_geo_unet(pos_map)
+        color_map = self.gs_color_unet(pos_map)
+
+        motion_attributes = self._unprojection(motion_map)
+        geo_attributes = self._unprojection(geo_map)
+        color_attributes = self._unprojection(color_map)
+
+        self.gaussian._xyz = pos
+        self.gaussian._rotation = motion_attributes[:, :4].detach()
+        self.gaussian._scaling = geo_attributes[:, :3].detach()
+        self.gaussian._opacity = geo_attributes[:, 3:4].detach()
+        features = color_attributes.reshape(self.gaussian._xyz.shape[0], self.color_channel, 3)
+        self.gaussian._features_dc = features[:, 0:1, :].detach()
+        self.gaussian._features_rest = features[:, 1:, :].detach()
+        return copy.deepcopy(self.gaussian)
 
     def synthesize(self, rel_trans: torch.Tensor) -> GaussianModel:
         with torch.inference_mode():
-            warped_gaussian, warped_pos, warped_rot = self._warp_canonical_gaussian(rel_trans)
-            pos_map = self.pos_map.clone()
-            pos_map[self.non_empty_idx, self.non_empty_idy] = warped_pos
-            pos_map = pos_map.unsqueeze(0).permute(0, 3, 1, 2)
-
-            motion_map = self.gs_motion_unet(pos_map)
-            geo_map = self.gs_geo_unet(pos_map)
-            color_map = self.gs_color_unet(pos_map)
-
-            motion_attributes = self._unprojection(motion_map)
-            geo_attributes = self._unprojection(geo_map)
-            color_attributes = self._unprojection(color_map)
-
-            gaussian = warped_gaussian
-            gaussian._xyz = self._unprojection(pos_map).detach()
-            gaussian._rotation = motion_attributes[:, :4].detach()
-            gaussian._scaling = geo_attributes[:, :3].detach()
-            gaussian._opacity = geo_attributes[:, 3:4].detach()
-            features = color_attributes.reshape(gaussian._xyz.shape[0], self.color_channel, 3)
-            gaussian._features_dc = features[:, 0:1, :].detach()
-            gaussian._features_rest = features[:, 1:, :].detach()
+            warped_pos, warped_rot = self._warp_morton_points(rel_trans)
+            self.gaussian._xyz = warped_pos.detach()
+            self.gaussian._rotation = warped_rot.detach()
+            gaussian = self._forward_warpping(self.gaussian.get_xyz)
 
             # Warm-start style fallback for extremely early checkpoints that may predict near-zero rotation.
             if torch.allclose(gaussian._rotation.abs().sum(dim=1), torch.zeros_like(gaussian._rotation[:, 0]), atol=1e-8):

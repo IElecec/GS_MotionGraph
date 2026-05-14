@@ -115,7 +115,7 @@ class Database:
     def _collect_canonical_pair(directory: Path) -> Optional[CanonicalAssets]:
         joint_path = directory / "joint.ply"
         skin_path = directory / "skin.ply"
-        unet_path = directory / "unet.pth"
+        unet_path = directory / "state_dict.pth"
         morton_map_dir = directory / "morton_map"
 
         if not joint_path.exists() and not skin_path.exists() and not morton_map_dir.exists():
@@ -371,7 +371,7 @@ class Database:
         action_name: str,
         anim_name: str,
     ) -> Optional[Path]:
-        """Return canonical unet.pth for an animation, if available."""
+        """Return canonical state_dict.pth for an animation, if available."""
         assets = self.data[action_name][anim_name]
         canonical = assets.canonical
         if canonical is None:

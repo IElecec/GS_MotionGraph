@@ -178,7 +178,7 @@ class ReperformerSkinSynthesizer:
             )
         if checkpoint_path is None:
             raise FileNotFoundError(
-                f"Missing canonical unet.pth for {action}/{animation}."
+                f"Missing canonical state_dict.pth for {action}/{animation}."
             )
 
         self.joint_gaussian = GaussianModel(self.sh_degree)

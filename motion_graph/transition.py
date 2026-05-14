@@ -345,21 +345,22 @@ def build_transition_window_from_database(
             anchor_action = transition.source.action
             anchor_animation = transition.source.animation
             anchor_frame = frame.source_frame
-            base_joint = gaussian_cache[source_key][frame.source_frame]
             skin_synth = source_synth
         else:
             anchor = "target"
             anchor_action = transition.target.action
             anchor_animation = transition.target.animation
             anchor_frame = frame.target_frame
-            base_joint = gaussian_cache[target_key][frame.target_frame]
             skin_synth = target_synth
 
         frame.anchor = anchor
         frame.anchor_action = anchor_action
         frame.anchor_animation = anchor_animation
         frame.anchor_frame = anchor_frame
-        rel_trans = compute_relative_motion(base_joint, frame.joint_gaussian)
+        rel_trans = compute_relative_motion(
+            skin_synth.joint_gaussian,
+            frame.joint_gaussian,
+        )
         frame.skin_gaussian = skin_synth.synthesize(rel_trans)
 
     window["source"] = transition.source.to_dict()

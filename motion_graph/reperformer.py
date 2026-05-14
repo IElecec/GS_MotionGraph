@@ -206,7 +206,6 @@ class ReperformerSkinSynthesizer:
 
         joint_path = database.get_canonical_frame(action, animation, variant="joint")
         morton_assets = database.get_canonical_morton_map(action, animation)
-        checkpoint_path = database.get_canonical_unet(action, animation)
         if joint_path is None:
             raise FileNotFoundError(
                 f"Missing canonical joint.ply for {action}/{animation}."
@@ -214,10 +213,6 @@ class ReperformerSkinSynthesizer:
         if morton_assets is None:
             raise FileNotFoundError(
                 f"Missing canonical morton_map for {action}/{animation}."
-            )
-        if checkpoint_path is None:
-            raise FileNotFoundError(
-                f"Missing canonical state_dict.pth for {action}/{animation}."
             )
 
         self.joint_gaussian = GaussianModel(self.sh_degree)
@@ -232,21 +227,36 @@ class ReperformerSkinSynthesizer:
         self.non_empty_idy = torch.from_numpy(np.load(morton_assets["v"])).long().to(self.device)
         self.raw_xyz = self.pos_map[self.non_empty_idx, self.non_empty_idy, :].clone().detach()
         self.raw_rot = self.rotation_map[self.non_empty_idx, self.non_empty_idy, :].clone().detach()
+        self._validate_canonical_binding_sources()
         self.graph_weights, self.indices = self._build_skin_to_joint_graph(
             points=self.raw_xyz,
             joints=self.joint_gaussian.get_xyz.detach(),
         )
 
-        self.color_channel = (self.sh_degree + 1) ** 2
-        self.gs_motion_unet = ReperformerUNet(3, 4).to(self.device)
-        self.gs_geo_unet = ReperformerUNet(3, 4).to(self.device)
-        self.gs_color_unet = ReperformerUNet(3, self.color_channel * 3).to(self.device)
-        self._load_checkpoint(Path(checkpoint_path))
-        self.gs_motion_unet.eval()
-        self.gs_geo_unet.eval()
-        self.gs_color_unet.eval()
-        self.gaussian = GaussianModel(self.sh_degree)
-        self.gaussian.active_sh_degree = self.sh_degree
+    def _validate_canonical_binding_sources(self) -> None:
+        point_count = int(self.raw_xyz.shape[0])
+        if point_count == 0:
+            raise ValueError(
+                f"Canonical morton_map for {self.action}/{self.animation} does not contain any non-empty vertices."
+            )
+        if int(self.raw_rot.shape[0]) != point_count:
+            raise ValueError(
+                f"Canonical morton_map rotation count mismatch for {self.action}/{self.animation}."
+            )
+        canonical_skin_xyz = self.gaussian_canonical.get_xyz.detach()
+        if int(canonical_skin_xyz.shape[0]) != point_count:
+            raise ValueError(
+                "Canonical morton_map point count mismatch for "
+                f"{self.action}/{self.animation}: "
+                f"point_cloud.ply has {int(canonical_skin_xyz.shape[0])}, "
+                f"but pos.npy/u.npy/v.npy expose {point_count} vertices."
+            )
+        if not torch.allclose(canonical_skin_xyz, self.raw_xyz, atol=1e-6, rtol=1e-5):
+            max_delta = torch.max(torch.abs(canonical_skin_xyz - self.raw_xyz)).item()
+            raise ValueError(
+                "Canonical morton_map point_cloud.ply is not aligned with pos.npy/u.npy/v.npy "
+                f"for {self.action}/{self.animation} (max |delta|={max_delta:.6e})."
+            )
 
     def _build_skin_to_joint_graph(
         self,
@@ -322,38 +332,13 @@ class ReperformerSkinSynthesizer:
         new_rotations = batch_rotmat2qvec_torch(torch.matmul(rot_out, raw_rot_matrix))
         return pos_out, new_rotations
 
-    def _forward_warpping(self, warped_pos: torch.Tensor) -> GaussianModel:
-        pos_map = self.pos_map.clone()
-        pos_map[self.non_empty_idx, self.non_empty_idy] = warped_pos.to(self.device)
-        pos_map = pos_map.unsqueeze(0).permute(0, 3, 1, 2)
-
-        pos = self._unprojection(pos_map).detach()
-        motion_map = self.gs_motion_unet(pos_map)
-        geo_map = self.gs_geo_unet(pos_map)
-        color_map = self.gs_color_unet(pos_map)
-
-        motion_attributes = self._unprojection(motion_map)
-        geo_attributes = self._unprojection(geo_map)
-        color_attributes = self._unprojection(color_map)
-
-        self.gaussian._xyz = pos
-        self.gaussian._rotation = motion_attributes[:, :4].detach()
-        self.gaussian._scaling = geo_attributes[:, :3].detach()
-        self.gaussian._opacity = geo_attributes[:, 3:4].detach()
-        features = color_attributes.reshape(self.gaussian._xyz.shape[0], self.color_channel, 3)
-        self.gaussian._features_dc = features[:, 0:1, :].detach()
-        self.gaussian._features_rest = features[:, 1:, :].detach()
-        return copy.deepcopy(self.gaussian)
+    def _warp_canonical_gaussian(self, rel_trans: torch.Tensor) -> GaussianModel:
+        warped_pos, warped_rot = self._warp_morton_points(rel_trans)
+        gaussian = copy.deepcopy(self.gaussian_canonical)
+        gaussian._xyz = warped_pos.detach()
+        gaussian._rotation = warped_rot.detach()
+        return gaussian
 
     def synthesize(self, rel_trans: torch.Tensor) -> GaussianModel:
         with torch.inference_mode():
-            warped_pos, warped_rot = self._warp_morton_points(rel_trans)
-            self.gaussian._xyz = warped_pos.detach()
-            self.gaussian._rotation = warped_rot.detach()
-            gaussian = self._forward_warpping(self.gaussian.get_xyz)
-
-            # Warm-start style fallback for extremely early checkpoints that may predict near-zero rotation.
-            if torch.allclose(gaussian._rotation.abs().sum(dim=1), torch.zeros_like(gaussian._rotation[:, 0]), atol=1e-8):
-                gaussian._rotation = warped_rot.detach()
-
-            return gaussian
+            return self._warp_canonical_gaussian(rel_trans)

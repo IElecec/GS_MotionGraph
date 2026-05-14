@@ -2,4 +2,4 @@ data/
 __pycache__/
 outputs/
 .vscode/
-generate_sample_char1.py
+*.sh

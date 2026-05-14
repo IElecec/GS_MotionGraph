@@ -112,6 +112,7 @@ def export_transition_windows(
 ) -> List[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     gaussian_cache = {}
+    skin_synth_cache = {}
     saved_dirs: List[Path] = []
 
     for transition_idx, transition in enumerate(tqdm(transitions, desc="Exporting transition windows")):
@@ -121,6 +122,7 @@ def export_transition_windows(
             sh_degree=sh_degree,
             num_transition_frames=num_transition_frames,
             gaussian_cache=gaussian_cache,
+            skin_synth_cache=skin_synth_cache,
         )
         transition_dir = output_dir / (
             f"{transition_idx:04d}_"

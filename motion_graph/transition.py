@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
+from .reperformer import ReperformerSkinSynthesizer, compute_relative_motion
 from similarity.rotation import estimate_sequence_rotation, rotate_points
 from utils import Database, GaussianModel, load_gaussians
 
@@ -51,18 +52,32 @@ class GraphEdge:
         return asdict(self)
 
 
-@dataclass(frozen=True)
+@dataclass
 class TransitionFrame:
     source_frame: int
     target_frame: int
     alpha: float
-    gaussian: GaussianModel
+    joint_gaussian: GaussianModel
+    skin_gaussian: Optional[GaussianModel] = None
+    anchor: str = "source"
+    anchor_action: Optional[str] = None
+    anchor_animation: Optional[str] = None
+    anchor_frame: Optional[int] = None
+
+    @property
+    def gaussian(self) -> GaussianModel:
+        return self.skin_gaussian if self.skin_gaussian is not None else self.joint_gaussian
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "source_frame": self.source_frame,
             "target_frame": self.target_frame,
             "alpha": self.alpha,
+            "anchor": self.anchor,
+            "anchor_action": self.anchor_action,
+            "anchor_animation": self.anchor_animation,
+            "anchor_frame": self.anchor_frame,
+            "representation": "skin" if self.skin_gaussian is not None else "joint",
         }
 
 
@@ -112,6 +127,11 @@ def _shared_point_count(src: GaussianModel, dst: GaussianModel) -> int:
 
 def _slice_points(tensor: torch.Tensor, count: int) -> torch.Tensor:
     return tensor[:count]
+
+
+def _use_source_canonical(local_idx: int, total_frames: int) -> bool:
+    # When the transition length is odd, keep the middle synthesized frame on the start side.
+    return local_idx < (total_frames + 1) // 2
 
 
 def transition_from_dict(data: Dict[str, Any]) -> Transition:
@@ -242,7 +262,7 @@ def build_transition_window(
                 source_frame=src_idx,
                 target_frame=dst_idx,
                 alpha=float(alpha),
-                gaussian=synthesized,
+                joint_gaussian=synthesized,
             )
         )
 
@@ -261,9 +281,12 @@ def build_transition_window_from_database(
     sh_degree: int,
     num_transition_frames: int,
     gaussian_cache: Optional[Dict[Tuple[str, str, int], List[GaussianModel]]] = None,
+    skin_synth_cache: Optional[Dict[Tuple[str, str, int], ReperformerSkinSynthesizer]] = None,
 ) -> Dict[str, Any]:
     if gaussian_cache is None:
         gaussian_cache = {}
+    if skin_synth_cache is None:
+        skin_synth_cache = {}
 
     source_key = (
         transition.source.action,
@@ -287,6 +310,17 @@ def build_transition_window_from_database(
             sh_degree=sh_degree,
         )
 
+    def get_skin_synthesizer(action: str, animation: str) -> ReperformerSkinSynthesizer:
+        key = (action, animation, sh_degree)
+        if key not in skin_synth_cache:
+            skin_synth_cache[key] = ReperformerSkinSynthesizer(
+                database=database,
+                action=action,
+                animation=animation,
+                sh_degree=sh_degree,
+            )
+        return skin_synth_cache[key]
+
     window = build_transition_window(
         source_gaussians=gaussian_cache[source_key],
         target_gaussians=gaussian_cache[target_key],
@@ -295,6 +329,39 @@ def build_transition_window_from_database(
         num_transition_frames=num_transition_frames,
         theta=transition.theta,
     )
+
+    source_synth = get_skin_synthesizer(transition.source.action, transition.source.animation)
+    target_synth = (
+        source_synth
+        if (
+            transition.source.action == transition.target.action
+            and transition.source.animation == transition.target.animation
+        )
+        else get_skin_synthesizer(transition.target.action, transition.target.animation)
+    )
+    for local_idx, frame in enumerate(window["frames"]):
+        if _use_source_canonical(local_idx, len(window["frames"])):
+            anchor = "source"
+            anchor_action = transition.source.action
+            anchor_animation = transition.source.animation
+            anchor_frame = frame.source_frame
+            base_joint = gaussian_cache[source_key][frame.source_frame]
+            skin_synth = source_synth
+        else:
+            anchor = "target"
+            anchor_action = transition.target.action
+            anchor_animation = transition.target.animation
+            anchor_frame = frame.target_frame
+            base_joint = gaussian_cache[target_key][frame.target_frame]
+            skin_synth = target_synth
+
+        frame.anchor = anchor
+        frame.anchor_action = anchor_action
+        frame.anchor_animation = anchor_animation
+        frame.anchor_frame = anchor_frame
+        rel_trans = compute_relative_motion(base_joint, frame.joint_gaussian)
+        frame.skin_gaussian = skin_synth.synthesize(rel_trans)
+
     window["source"] = transition.source.to_dict()
     window["target"] = transition.target.to_dict()
     window["distance"] = transition.distance
@@ -312,6 +379,12 @@ def save_transition_window(window: Dict[str, Any], output_dir: Path) -> List[Pat
         "target_frame": window["target_frame"],
         "num_transition_frames": window["num_transition_frames"],
         "theta": window["theta"],
+        "root_representation": (
+            "skin" if any(frame.skin_gaussian is not None for frame in window["frames"]) else "joint"
+        ),
+        "joint_transition_dir": (
+            "joint" if any(frame.skin_gaussian is not None for frame in window["frames"]) else None
+        ),
         "frames": [frame.to_dict() for frame in window["frames"]],
     }
 
@@ -319,9 +392,13 @@ def save_transition_window(window: Dict[str, Any], output_dir: Path) -> List[Pat
         json.dump(manifest, handle, indent=2)
 
     saved_paths: List[Path] = []
+    joint_output_dir = output_dir / "joint"
     for local_idx, frame in enumerate(window["frames"]):
         frame_path = output_dir / f"point_cloud_{local_idx}.ply"
         frame.gaussian.save_ply(str(frame_path))
+        if frame.skin_gaussian is not None:
+            joint_path = joint_output_dir / f"point_cloud_{local_idx}.ply"
+            frame.joint_gaussian.save_ply(str(joint_path))
         saved_paths.append(frame_path)
 
     return saved_paths

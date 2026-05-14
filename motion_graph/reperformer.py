@@ -281,9 +281,19 @@ class ReperformerSkinSynthesizer:
         new_rotations = batch_rotmat2qvec_torch(torch.matmul(rot_out, raw_rot_matrix))
         return pos_out, new_rotations
 
+    def _warp_canonical_gaussian(
+        self,
+        rel_trans: torch.Tensor,
+    ) -> Tuple[GaussianModel, torch.Tensor, torch.Tensor]:
+        warped_pos, warped_rot = self._warp_morton_points(rel_trans)
+        gaussian = copy.deepcopy(self.gaussian_canonical)
+        gaussian._xyz = warped_pos.detach()
+        gaussian._rotation = warped_rot.detach()
+        return gaussian, warped_pos, warped_rot
+
     def synthesize(self, rel_trans: torch.Tensor) -> GaussianModel:
         with torch.inference_mode():
-            warped_pos, warped_rot = self._warp_morton_points(rel_trans)
+            warped_gaussian, warped_pos, warped_rot = self._warp_canonical_gaussian(rel_trans)
             pos_map = self.pos_map.clone()
             pos_map[self.non_empty_idx, self.non_empty_idy] = warped_pos
             pos_map = pos_map.unsqueeze(0).permute(0, 3, 1, 2)
@@ -296,7 +306,7 @@ class ReperformerSkinSynthesizer:
             geo_attributes = self._unprojection(geo_map)
             color_attributes = self._unprojection(color_map)
 
-            gaussian = copy.deepcopy(self.gaussian_canonical)
+            gaussian = warped_gaussian
             gaussian._xyz = self._unprojection(pos_map).detach()
             gaussian._rotation = motion_attributes[:, :4].detach()
             gaussian._scaling = geo_attributes[:, :3].detach()

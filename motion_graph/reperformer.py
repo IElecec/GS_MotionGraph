@@ -206,6 +206,7 @@ class ReperformerSkinSynthesizer:
 
         joint_path = database.get_canonical_frame(action, animation, variant="joint")
         morton_assets = database.get_canonical_morton_map(action, animation)
+        checkpoint_path = database.get_canonical_unet(action, animation)
         if joint_path is None:
             raise FileNotFoundError(
                 f"Missing canonical joint.ply for {action}/{animation}."
@@ -213,6 +214,10 @@ class ReperformerSkinSynthesizer:
         if morton_assets is None:
             raise FileNotFoundError(
                 f"Missing canonical morton_map for {action}/{animation}."
+            )
+        if checkpoint_path is None:
+            raise FileNotFoundError(
+                f"Missing canonical state_dict.pth for {action}/{animation}."
             )
 
         self.joint_gaussian = GaussianModel(self.sh_degree)
@@ -232,6 +237,9 @@ class ReperformerSkinSynthesizer:
             points=self.raw_xyz,
             joints=self.joint_gaussian.get_xyz.detach(),
         )
+        self.gs_motion_unet = ReperformerUNet(3, 4).to(self.device)
+        self._load_checkpoint(Path(checkpoint_path))
+        self.gs_motion_unet.eval()
 
     def _validate_canonical_binding_sources(self) -> None:
         point_count = int(self.raw_xyz.shape[0])
@@ -300,8 +308,6 @@ class ReperformerSkinSynthesizer:
             model.load_state_dict(normalize_state_dict(state_dict), strict=False)
 
         safe_load(self.gs_motion_unet, "gs_motion_unet")
-        safe_load(self.gs_geo_unet, "gs_geo_unet")
-        safe_load(self.gs_color_unet, "gs_color_unet")
 
     def _unprojection(self, feature_map: torch.Tensor) -> torch.Tensor:
         vertices = feature_map[0][:, self.non_empty_idx, self.non_empty_idy]
@@ -332,13 +338,28 @@ class ReperformerSkinSynthesizer:
         new_rotations = batch_rotmat2qvec_torch(torch.matmul(rot_out, raw_rot_matrix))
         return pos_out, new_rotations
 
-    def _warp_canonical_gaussian(self, rel_trans: torch.Tensor) -> GaussianModel:
+    def _forward_motion_only(self, rel_trans: torch.Tensor) -> GaussianModel:
         warped_pos, warped_rot = self._warp_morton_points(rel_trans)
+        pos_map = self.pos_map.clone()
+        pos_map[self.non_empty_idx, self.non_empty_idy] = warped_pos.to(self.device)
+        pos_map = pos_map.unsqueeze(0).permute(0, 3, 1, 2)
+
+        pos = self._unprojection(pos_map).detach()
+        motion_map = self.gs_motion_unet(pos_map)
+        motion_attributes = self._unprojection(motion_map)
+
         gaussian = copy.deepcopy(self.gaussian_canonical)
-        gaussian._xyz = warped_pos.detach()
-        gaussian._rotation = warped_rot.detach()
+        gaussian._xyz = pos
+        gaussian._rotation = motion_attributes[:, :4].detach()
+
+        if torch.allclose(
+            gaussian._rotation.abs().sum(dim=1),
+            torch.zeros_like(gaussian._rotation[:, 0]),
+            atol=1e-8,
+        ):
+            gaussian._rotation = warped_rot.detach()
         return gaussian
 
     def synthesize(self, rel_trans: torch.Tensor) -> GaussianModel:
         with torch.inference_mode():
-            return self._warp_canonical_gaussian(rel_trans)
+            return self._forward_motion_only(rel_trans)

@@ -8,7 +8,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from .reperformer import ReperformerSkinSynthesizer, compute_relative_motion
+from .reperformer import (
+    ReperformerSkinSynthesizer,
+    apply_relative_motion,
+    compute_relative_motion,
+    load_relative_motion,
+    save_relative_motion,
+)
 from similarity.rotation import estimate_sequence_rotation, rotate_points
 from utils import Database, GaussianModel, load_gaussians
 
@@ -59,6 +65,8 @@ class TransitionFrame:
     alpha: float
     joint_gaussian: GaussianModel
     skin_gaussian: Optional[GaussianModel] = None
+    relative_motion: Optional[torch.Tensor] = None
+    canonical_joint_source: Optional[GaussianModel] = None
     anchor: str = "source"
     anchor_action: Optional[str] = None
     anchor_animation: Optional[str] = None
@@ -361,6 +369,8 @@ def build_transition_window_from_database(
             skin_synth.joint_gaussian,
             frame.joint_gaussian,
         )
+        frame.relative_motion = rel_trans.detach().cpu()
+        frame.canonical_joint_source = skin_synth.joint_gaussian
         frame.skin_gaussian = skin_synth.synthesize(rel_trans)
 
     window["source"] = transition.source.to_dict()
@@ -386,6 +396,12 @@ def save_transition_window(window: Dict[str, Any], output_dir: Path) -> List[Pat
         "joint_transition_dir": (
             "joint" if any(frame.skin_gaussian is not None for frame in window["frames"]) else None
         ),
+        "relative_motion_dir": (
+            "relative_motion" if any(frame.relative_motion is not None for frame in window["frames"]) else None
+        ),
+        "canonical_joint_dir": (
+            "canonical_joint" if any(frame.relative_motion is not None for frame in window["frames"]) else None
+        ),
         "frames": [frame.to_dict() for frame in window["frames"]],
     }
 
@@ -394,12 +410,24 @@ def save_transition_window(window: Dict[str, Any], output_dir: Path) -> List[Pat
 
     saved_paths: List[Path] = []
     joint_output_dir = output_dir / "joint"
+    rel_motion_output_dir = output_dir / "relative_motion"
+    canonical_joint_output_dir = output_dir / "canonical_joint"
     for local_idx, frame in enumerate(window["frames"]):
         frame_path = output_dir / f"point_cloud_{local_idx}.ply"
         frame.gaussian.save_ply(str(frame_path))
         if frame.skin_gaussian is not None:
             joint_path = joint_output_dir / f"point_cloud_{local_idx}.ply"
             frame.joint_gaussian.save_ply(str(joint_path))
+        if frame.relative_motion is not None and frame.canonical_joint_source is not None:
+            rel_motion_path = rel_motion_output_dir / f"rel_trans_{local_idx}.bin"
+            save_relative_motion(rel_motion_path, frame.relative_motion)
+            loaded_rel_trans = load_relative_motion(
+                rel_motion_path,
+                device=frame.canonical_joint_source.get_xyz.device,
+            )
+            canonical_joint = apply_relative_motion(frame.canonical_joint_source, loaded_rel_trans)
+            canonical_joint_path = canonical_joint_output_dir / f"point_cloud_{local_idx}.ply"
+            canonical_joint.save_ply(str(canonical_joint_path))
         saved_paths.append(frame_path)
 
     return saved_paths

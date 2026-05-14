@@ -38,6 +38,45 @@ def compute_relative_motion(src: GaussianModel, dst: GaussianModel) -> torch.Ten
     return torch.cat([rel_rots, rel_xyz], dim=2).reshape(-1, 3, 4)
 
 
+def save_relative_motion(path: Path, rel_trans: torch.Tensor) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(rel_trans.detach().to(torch.float32).cpu().reshape(-1, 3, 4), str(path))
+    return path
+
+
+def load_relative_motion(path: Path, device: Optional[torch.device] = None) -> torch.Tensor:
+    rel_trans = torch.load(str(path), map_location="cpu").to(torch.float32).reshape(-1, 3, 4)
+    if device is not None:
+        rel_trans = rel_trans.to(device)
+    return rel_trans
+
+
+def apply_relative_motion(src: GaussianModel, rel_trans: torch.Tensor) -> GaussianModel:
+    point_count = min(src.get_xyz.shape[0], rel_trans.shape[0])
+    if point_count == 0:
+        raise ValueError("Cannot apply relative motion to an empty Gaussian model.")
+
+    device = src.get_xyz.device
+    rel_trans = rel_trans.to(device=device, dtype=torch.float32).reshape(-1, 3, 4)
+    rel_rots = rel_trans[:point_count, :, :3]
+    rel_xyz = rel_trans[:point_count, :, 3]
+
+    src_xyz = src.get_xyz[:point_count].reshape(-1, 3, 1)
+    warped_xyz = torch.einsum("ijk,ikn->ijn", rel_rots, src_xyz).squeeze(-1) + rel_xyz
+
+    src_rot_matrix = batch_qvec2rotmat_torch(norm_quaternion(src.get_rotation[:point_count]))
+    warped_rot = batch_rotmat2qvec_torch(torch.matmul(rel_rots, src_rot_matrix))
+
+    out = copy.deepcopy(src)
+    out._xyz = warped_xyz.detach()
+    out._rotation = warped_rot.detach()
+    out._opacity = src._opacity[:point_count].detach().clone()
+    out._scaling = src._scaling[:point_count].detach().clone()
+    out._features_dc = src._features_dc[:point_count].detach().clone()
+    out._features_rest = src._features_rest[:point_count].detach().clone()
+    return out
+
+
 class SelfAttention(nn.Module):
     def __init__(self, in_channels: int):
         super().__init__()

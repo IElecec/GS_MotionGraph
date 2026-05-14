@@ -64,9 +64,11 @@ class TransitionFrame:
     target_frame: int
     alpha: float
     joint_gaussian: GaussianModel
+    original_joint_gaussian: Optional[GaussianModel] = None
     skin_gaussian: Optional[GaussianModel] = None
     relative_motion: Optional[torch.Tensor] = None
     canonical_joint_source: Optional[GaussianModel] = None
+    joint_reprojection_max_error: Optional[float] = None
     anchor: str = "source"
     anchor_action: Optional[str] = None
     anchor_animation: Optional[str] = None
@@ -85,6 +87,7 @@ class TransitionFrame:
             "anchor_action": self.anchor_action,
             "anchor_animation": self.anchor_animation,
             "anchor_frame": self.anchor_frame,
+            "joint_reprojection_max_error": self.joint_reprojection_max_error,
             "representation": "skin" if self.skin_gaussian is not None else "joint",
         }
 
@@ -135,6 +138,14 @@ def _shared_point_count(src: GaussianModel, dst: GaussianModel) -> int:
 
 def _slice_points(tensor: torch.Tensor, count: int) -> torch.Tensor:
     return tensor[:count]
+
+
+def _position_alignment_error(src: GaussianModel, dst: GaussianModel) -> float:
+    point_count = _shared_point_count(src, dst)
+    if point_count == 0:
+        return 0.0
+    delta = _slice_points(src.get_xyz, point_count) - _slice_points(dst.get_xyz, point_count)
+    return float(torch.linalg.norm(delta, dim=1).max().item())
 
 
 def _use_source_canonical(local_idx: int, total_frames: int) -> bool:
@@ -369,6 +380,13 @@ def build_transition_window_from_database(
             skin_synth.joint_gaussian,
             frame.joint_gaussian,
         )
+        reconstructed_joint = apply_relative_motion(skin_synth.joint_gaussian, rel_trans)
+        frame.original_joint_gaussian = frame.joint_gaussian
+        frame.joint_reprojection_max_error = _position_alignment_error(
+            reconstructed_joint,
+            frame.original_joint_gaussian,
+        )
+        frame.joint_gaussian = reconstructed_joint
         frame.relative_motion = rel_trans.detach().cpu()
         frame.canonical_joint_source = skin_synth.joint_gaussian
         frame.skin_gaussian = skin_synth.synthesize(rel_trans)
@@ -396,6 +414,9 @@ def save_transition_window(window: Dict[str, Any], output_dir: Path) -> List[Pat
         "joint_transition_dir": (
             "joint" if any(frame.skin_gaussian is not None for frame in window["frames"]) else None
         ),
+        "joint_transition_raw_dir": (
+            "joint_raw" if any(frame.original_joint_gaussian is not None for frame in window["frames"]) else None
+        ),
         "relative_motion_dir": (
             "relative_motion" if any(frame.relative_motion is not None for frame in window["frames"]) else None
         ),
@@ -410,6 +431,7 @@ def save_transition_window(window: Dict[str, Any], output_dir: Path) -> List[Pat
 
     saved_paths: List[Path] = []
     joint_output_dir = output_dir / "joint"
+    joint_raw_output_dir = output_dir / "joint_raw"
     rel_motion_output_dir = output_dir / "relative_motion"
     canonical_joint_output_dir = output_dir / "canonical_joint"
     for local_idx, frame in enumerate(window["frames"]):
@@ -418,6 +440,9 @@ def save_transition_window(window: Dict[str, Any], output_dir: Path) -> List[Pat
         if frame.skin_gaussian is not None:
             joint_path = joint_output_dir / f"point_cloud_{local_idx}.ply"
             frame.joint_gaussian.save_ply(str(joint_path))
+        if frame.original_joint_gaussian is not None:
+            joint_raw_path = joint_raw_output_dir / f"point_cloud_{local_idx}.ply"
+            frame.original_joint_gaussian.save_ply(str(joint_raw_path))
         if frame.relative_motion is not None and frame.canonical_joint_source is not None:
             rel_motion_path = rel_motion_output_dir / f"rel_trans_{local_idx}.bin"
             save_relative_motion(rel_motion_path, frame.relative_motion)

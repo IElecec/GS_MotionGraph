@@ -132,19 +132,8 @@ def _matrix_index_to_target_frame(index: int, mode: str, window_size: int) -> in
     raise ValueError(f"Unsupported matrix index mode: {mode}")
 
 
-def _shared_point_count(src: GaussianModel, dst: GaussianModel) -> int:
-    return min(src.get_xyz.shape[0], dst.get_xyz.shape[0])
-
-
-def _slice_points(tensor: torch.Tensor, count: int) -> torch.Tensor:
-    return tensor[:count]
-
-
 def _position_alignment_error(src: GaussianModel, dst: GaussianModel) -> float:
-    point_count = _shared_point_count(src, dst)
-    if point_count == 0:
-        return 0.0
-    delta = _slice_points(src.get_xyz, point_count) - _slice_points(dst.get_xyz, point_count)
+    delta = src.get_xyz - dst.get_xyz
     return float(torch.linalg.norm(delta, dim=1).max().item())
 
 
@@ -213,14 +202,10 @@ def synthesize_transition_gaussian(
     alpha: float,
     theta: float = 0.0,
 ) -> GaussianModel:
-    point_count = _shared_point_count(src, dst)
-    if point_count == 0:
-        raise ValueError("Cannot synthesize transition from empty Gaussian models.")
-
     out = copy.deepcopy(src)
 
-    src_xyz = _slice_points(src.get_xyz, point_count)
-    dst_xyz = _slice_points(dst.get_xyz, point_count)
+    src_xyz = src.get_xyz
+    dst_xyz = dst.get_xyz
 
     src_center = src_xyz.mean(dim=0, keepdim=True)
     dst_center = dst_xyz.mean(dim=0, keepdim=True)
@@ -235,17 +220,17 @@ def synthesize_transition_gaussian(
     mixed_xyz = alpha * src_xyz_centered + (1.0 - alpha) * dst_xyz_centered
     mixed_center = alpha * src_center + (1.0 - alpha) * dst_center
 
-    src_opacity = _slice_points(src._opacity, point_count)
-    dst_opacity = _slice_points(dst._opacity, point_count)
-    src_scaling = _slice_points(src._scaling, point_count)
-    dst_scaling = _slice_points(dst._scaling, point_count)
-    src_features_dc = _slice_points(src._features_dc, point_count)
-    dst_features_dc = _slice_points(dst._features_dc, point_count)
-    src_features_rest = _slice_points(src._features_rest, point_count)
-    dst_features_rest = _slice_points(dst._features_rest, point_count)
+    src_opacity = src._opacity
+    dst_opacity = dst._opacity
+    src_scaling = src._scaling
+    dst_scaling = dst._scaling
+    src_features_dc = src._features_dc
+    dst_features_dc = dst._features_dc
+    src_features_rest = src._features_rest
+    dst_features_rest = dst._features_rest
 
-    q_src = _slice_points(src.get_rotation, point_count)
-    q_dst = _slice_points(dst.get_rotation, point_count)
+    q_src = src.get_rotation
+    q_dst = dst.get_rotation
     q_mix = slerp_quaternion(q_src, q_dst, 1.0 - alpha)
 
     out._xyz = mixed_xyz + mixed_center

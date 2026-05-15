@@ -21,18 +21,14 @@ from utils.utils_gaussians.calc_utils import (
 
 
 def compute_relative_motion(src: GaussianModel, dst: GaussianModel) -> torch.Tensor:
-    point_count = min(src.get_xyz.shape[0], dst.get_xyz.shape[0])
-    if point_count == 0:
-        raise ValueError("Cannot compute relative motion from empty Gaussian models.")
-
-    src_rot = norm_quaternion(src.get_rotation[:point_count])
-    dst_rot = norm_quaternion(dst.get_rotation[:point_count])
+    src_rot = norm_quaternion(src.get_rotation)
+    dst_rot = norm_quaternion(dst.get_rotation)
     rel_rotations = quaternion_multiply(dst_rot, quaternion_inverse(src_rot))
     rel_rotations = norm_quaternion(rel_rotations)
     rel_rots = build_rotation(rel_rotations)
 
-    src_xyz = src.get_xyz[:point_count].reshape(-1, 3, 1)
-    dst_xyz = dst.get_xyz[:point_count].reshape(-1, 3, 1)
+    src_xyz = src.get_xyz.reshape(-1, 3, 1)
+    dst_xyz = dst.get_xyz.reshape(-1, 3, 1)
     rel_xyz = dst_xyz - torch.einsum("ijk,ikn->ijn", rel_rots, src_xyz)
 
     return torch.cat([rel_rots, rel_xyz], dim=2).reshape(-1, 3, 4)
@@ -52,28 +48,24 @@ def load_relative_motion(path: Path, device: Optional[torch.device] = None) -> t
 
 
 def apply_relative_motion(src: GaussianModel, rel_trans: torch.Tensor) -> GaussianModel:
-    point_count = min(src.get_xyz.shape[0], rel_trans.shape[0])
-    if point_count == 0:
-        raise ValueError("Cannot apply relative motion to an empty Gaussian model.")
-
     device = src.get_xyz.device
     rel_trans = rel_trans.to(device=device, dtype=torch.float32).reshape(-1, 3, 4)
-    rel_rots = rel_trans[:point_count, :, :3]
-    rel_xyz = rel_trans[:point_count, :, 3]
+    rel_rots = rel_trans[:, :, :3]
+    rel_xyz = rel_trans[:, :, 3]
 
-    src_xyz = src.get_xyz[:point_count].reshape(-1, 3, 1)
+    src_xyz = src.get_xyz.reshape(-1, 3, 1)
     warped_xyz = torch.einsum("ijk,ikn->ijn", rel_rots, src_xyz).squeeze(-1) + rel_xyz
 
-    src_rot_matrix = batch_qvec2rotmat_torch(norm_quaternion(src.get_rotation[:point_count]))
+    src_rot_matrix = batch_qvec2rotmat_torch(norm_quaternion(src.get_rotation))
     warped_rot = batch_rotmat2qvec_torch(torch.matmul(rel_rots, src_rot_matrix))
 
     out = copy.deepcopy(src)
     out._xyz = warped_xyz.detach()
     out._rotation = warped_rot.detach()
-    out._opacity = src._opacity[:point_count].detach().clone()
-    out._scaling = src._scaling[:point_count].detach().clone()
-    out._features_dc = src._features_dc[:point_count].detach().clone()
-    out._features_rest = src._features_rest[:point_count].detach().clone()
+    out._opacity = src._opacity.detach().clone()
+    out._scaling = src._scaling.detach().clone()
+    out._features_dc = src._features_dc.detach().clone()
+    out._features_rest = src._features_rest.detach().clone()
     return out
 
 
@@ -257,19 +249,13 @@ class ReperformerSkinSynthesizer:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         points_np = points.detach().cpu().numpy()
         joints_np = joints.detach().cpu().numpy()
-        neighbor_count = min(int(k), len(joints_np))
-        if neighbor_count <= 0:
-            raise ValueError(
-                f"Canonical joint.ply for {self.action}/{self.animation} is empty."
-            )
-
-        nbrs = NearestNeighbors(n_neighbors=neighbor_count, algorithm="kd_tree").fit(joints_np)
+        nbrs = NearestNeighbors(n_neighbors=int(k), algorithm="kd_tree").fit(joints_np)
         dists, indices = nbrs.kneighbors(points_np)
 
         dist_t = torch.from_numpy(dists).float().to(self.device)
         idx_t = torch.from_numpy(indices).long().to(self.device)
         weights = torch.exp(-1.0 * dist_t ** 2 / (length_scale ** 2))
-        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        weights = weights / weights.sum(dim=1, keepdim=True)
         return weights.unsqueeze(-1), idx_t
 
     def _load_checkpoint(self, checkpoint_path: Path) -> None:
@@ -299,17 +285,8 @@ class ReperformerSkinSynthesizer:
 
     def _warp_morton_points(self, rel_trans: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         rel_trans = rel_trans.to(self.device, dtype=torch.float32).reshape(-1, 3, 4)
-        max_joint_count = rel_trans.shape[0]
-        safe_indices = self.indices.clamp(max=max_joint_count - 1)
-        valid = self.indices < max_joint_count
-        if not torch.all(valid.any(dim=1)):
-            raise ValueError(
-                "Relative motion does not cover enough joints to warp the canonical morton map."
-            )
-
-        gathered = rel_trans[safe_indices]
-        weights = self.graph_weights * valid.unsqueeze(-1)
-        weights = weights / weights.sum(dim=1, keepdim=True).clamp_min(1e-8)
+        gathered = rel_trans[self.indices]
+        weights = self.graph_weights
 
         rotations = gathered[..., :3]
         translations = gathered[..., 3]
@@ -350,10 +327,4 @@ class ReperformerSkinSynthesizer:
             warped_pos, warped_rot = self._warp_morton_points(rel_trans)
             self.gaussian._xyz = warped_pos.detach()
             self.gaussian._rotation = warped_rot.detach()
-            gaussian = self._forward_warpping(self.gaussian.get_xyz)
-
-            # Warm-start style fallback for extremely early checkpoints that may predict near-zero rotation.
-            if torch.allclose(gaussian._rotation.abs().sum(dim=1), torch.zeros_like(gaussian._rotation[:, 0]), atol=1e-8):
-                gaussian._rotation = warped_rot.detach()
-
-            return gaussian
+            return self._forward_warpping(self.gaussian.get_xyz)

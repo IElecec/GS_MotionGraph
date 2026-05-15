@@ -153,6 +153,26 @@ def _use_source_canonical(local_idx: int, total_frames: int) -> bool:
     return local_idx < (total_frames + 1) // 2
 
 
+def _build_canonical_unet_sequence(
+    sequence_gaussians: List[GaussianModel],
+    frame_indices: List[int],
+    skin_synth: ReperformerSkinSynthesizer,
+) -> List[Dict[str, Any]]:
+    synthesized_sequence: List[Dict[str, Any]] = []
+    for frame_index in frame_indices:
+        rel_trans = compute_relative_motion(
+            skin_synth.joint_gaussian,
+            sequence_gaussians[frame_index],
+        )
+        synthesized_sequence.append(
+            {
+                "frame": int(frame_index),
+                "gaussian": skin_synth.synthesize(rel_trans),
+            }
+        )
+    return synthesized_sequence
+
+
 def transition_from_dict(data: Dict[str, Any]) -> Transition:
     return Transition(
         source=FrameRef(**data["source"]),
@@ -358,6 +378,11 @@ def build_transition_window_from_database(
         )
         else get_skin_synthesizer(transition.target.action, transition.target.animation)
     )
+    sequence_length = num_transition_frames + 2
+    target_start = transition.target.frame - sequence_length + 1
+    source_sequence_indices = list(range(transition.source.frame, transition.source.frame + sequence_length))
+    target_sequence_indices = list(range(target_start, transition.target.frame + 1))
+
     for local_idx, frame in enumerate(window["frames"]):
         if _use_source_canonical(local_idx, len(window["frames"])):
             anchor = "source"
@@ -394,6 +419,16 @@ def build_transition_window_from_database(
     window["source"] = transition.source.to_dict()
     window["target"] = transition.target.to_dict()
     window["distance"] = transition.distance
+    window["source_sequence_unet"] = _build_canonical_unet_sequence(
+        sequence_gaussians=gaussian_cache[source_key],
+        frame_indices=source_sequence_indices,
+        skin_synth=source_synth,
+    )
+    window["target_sequence_unet"] = _build_canonical_unet_sequence(
+        sequence_gaussians=gaussian_cache[target_key],
+        frame_indices=target_sequence_indices,
+        skin_synth=target_synth,
+    )
     return window
 
 
@@ -423,6 +458,18 @@ def save_transition_window(window: Dict[str, Any], output_dir: Path) -> List[Pat
         "canonical_joint_dir": (
             "canonical_joint" if any(frame.relative_motion is not None for frame in window["frames"]) else None
         ),
+        "source_sequence_unet_dir": (
+            "source_sequence_unet" if window.get("source_sequence_unet") else None
+        ),
+        "target_sequence_unet_dir": (
+            "target_sequence_unet" if window.get("target_sequence_unet") else None
+        ),
+        "source_sequence_unet_frames": [
+            item["frame"] for item in window.get("source_sequence_unet", [])
+        ],
+        "target_sequence_unet_frames": [
+            item["frame"] for item in window.get("target_sequence_unet", [])
+        ],
         "frames": [frame.to_dict() for frame in window["frames"]],
     }
 
@@ -434,6 +481,8 @@ def save_transition_window(window: Dict[str, Any], output_dir: Path) -> List[Pat
     joint_raw_output_dir = output_dir / "joint_raw"
     rel_motion_output_dir = output_dir / "relative_motion"
     canonical_joint_output_dir = output_dir / "canonical_joint"
+    source_sequence_unet_output_dir = output_dir / "source_sequence_unet"
+    target_sequence_unet_output_dir = output_dir / "target_sequence_unet"
     for local_idx, frame in enumerate(window["frames"]):
         frame_path = output_dir / f"point_cloud_{local_idx}.ply"
         frame.gaussian.save_ply(str(frame_path))
@@ -454,6 +503,16 @@ def save_transition_window(window: Dict[str, Any], output_dir: Path) -> List[Pat
             canonical_joint_path = canonical_joint_output_dir / f"point_cloud_{local_idx}.ply"
             canonical_joint.save_ply(str(canonical_joint_path))
         saved_paths.append(frame_path)
+
+    for item in window.get("source_sequence_unet", []):
+        frame_index = int(item["frame"])
+        frame_path = source_sequence_unet_output_dir / f"point_cloud_{frame_index:04d}.ply"
+        item["gaussian"].save_ply(str(frame_path))
+
+    for item in window.get("target_sequence_unet", []):
+        frame_index = int(item["frame"])
+        frame_path = target_sequence_unet_output_dir / f"point_cloud_{frame_index:04d}.ply"
+        item["gaussian"].save_ply(str(frame_path))
 
     return saved_paths
 

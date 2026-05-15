@@ -211,12 +211,15 @@ class ReperformerSkinSynthesizer:
             raise FileNotFoundError(
                 f"Missing canonical state_dict.pth for {action}/{animation}."
             )
+        self.canonical_joint_path = Path(joint_path)
+        self.canonical_skin_path = Path(morton_assets["point_cloud"])
+        self.unet_checkpoint_path = Path(checkpoint_path)
 
         self.joint_gaussian = GaussianModel(self.sh_degree)
-        self.joint_gaussian.load_ply(str(joint_path))
+        self.joint_gaussian.load_ply(str(self.canonical_joint_path))
 
         self.gaussian_canonical = GaussianModel(self.sh_degree)
-        self.gaussian_canonical.load_ply(str(morton_assets["point_cloud"]))
+        self.gaussian_canonical.load_ply(str(self.canonical_skin_path))
 
         self.pos_map = torch.from_numpy(np.load(morton_assets["pos"])).float().to(self.device)
         self.rotation_map = torch.from_numpy(np.load(morton_assets["rotation"])).float().to(self.device)
@@ -233,7 +236,7 @@ class ReperformerSkinSynthesizer:
         self.gs_motion_unet = ReperformerUNet(3, 4).to(self.device)
         self.gs_geo_unet = ReperformerUNet(3, 4).to(self.device)
         self.gs_color_unet = ReperformerUNet(3, self.color_channel * 3).to(self.device)
-        self._load_checkpoint(Path(checkpoint_path))
+        self._load_checkpoint(self.unet_checkpoint_path)
         self.gs_motion_unet.eval()
         self.gs_geo_unet.eval()
         self.gs_color_unet.eval()
@@ -299,7 +302,19 @@ class ReperformerSkinSynthesizer:
         new_rotations = batch_rotmat2qvec_torch(torch.matmul(rot_out, raw_rot_matrix))
         return pos_out, new_rotations
 
-    def _forward_warpping(self, warped_pos: torch.Tensor) -> GaussianModel:
+    def _forward_warpping(
+        self,
+        warped_pos: torch.Tensor,
+        debug_tag: Optional[str] = None,
+    ) -> GaussianModel:
+        tag = debug_tag if debug_tag is not None else f"{self.action}/{self.animation}"
+        print(
+            "[forward_warpping] "
+            f"tag={tag} "
+            f"canonical_joint={self.canonical_joint_path} "
+            f"canonical_skin={self.canonical_skin_path} "
+            f"unet_checkpoint={self.unet_checkpoint_path}"
+        )
         pos_map = self.pos_map.clone()
         pos_map[self.non_empty_idx, self.non_empty_idy] = warped_pos.to(self.device)
         pos_map = pos_map.unsqueeze(0).permute(0, 3, 1, 2)
@@ -322,9 +337,13 @@ class ReperformerSkinSynthesizer:
         self.gaussian._features_rest = features[:, 1:, :].detach()
         return copy.deepcopy(self.gaussian)
 
-    def synthesize(self, rel_trans: torch.Tensor) -> GaussianModel:
+    def synthesize(
+        self,
+        rel_trans: torch.Tensor,
+        debug_tag: Optional[str] = None,
+    ) -> GaussianModel:
         with torch.inference_mode():
             warped_pos, warped_rot = self._warp_morton_points(rel_trans)
             self.gaussian._xyz = warped_pos.detach()
             self.gaussian._rotation = warped_rot.detach()
-            return self._forward_warpping(self.gaussian.get_xyz)
+            return self._forward_warpping(self.gaussian.get_xyz, debug_tag=debug_tag)

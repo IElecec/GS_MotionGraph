@@ -146,6 +146,7 @@ def _build_canonical_unet_sequence(
     sequence_gaussians: List[GaussianModel],
     frame_indices: List[int],
     skin_synth: ReperformerSkinSynthesizer,
+    sequence_name: str,
 ) -> List[Dict[str, Any]]:
     synthesized_sequence: List[Dict[str, Any]] = []
     for frame_index in frame_indices:
@@ -156,7 +157,13 @@ def _build_canonical_unet_sequence(
         synthesized_sequence.append(
             {
                 "frame": int(frame_index),
-                "gaussian": skin_synth.synthesize(rel_trans),
+                "gaussian": skin_synth.synthesize(
+                    rel_trans,
+                    debug_tag=(
+                        f"{sequence_name}:{skin_synth.action}/{skin_synth.animation}:"
+                        f"frame={int(frame_index)}"
+                    ),
+                ),
             }
         )
     return synthesized_sequence
@@ -399,7 +406,13 @@ def build_transition_window_from_database(
         frame.joint_gaussian = reconstructed_joint
         frame.relative_motion = rel_trans.detach().cpu()
         frame.canonical_joint_source = skin_synth.joint_gaussian
-        frame.skin_gaussian = skin_synth.synthesize(rel_trans)
+        frame.skin_gaussian = skin_synth.synthesize(
+            rel_trans,
+            debug_tag=(
+                f"transition:{anchor}:{anchor_action}/{anchor_animation}:"
+                f"source_frame={frame.source_frame}:target_frame={frame.target_frame}"
+            ),
+        )
 
     window["source"] = transition.source.to_dict()
     window["target"] = transition.target.to_dict()
@@ -408,11 +421,13 @@ def build_transition_window_from_database(
         sequence_gaussians=gaussian_cache[source_key],
         frame_indices=source_sequence_indices,
         skin_synth=source_synth,
+        sequence_name="source_sequence_unet",
     )
     window["target_sequence_unet"] = _build_canonical_unet_sequence(
         sequence_gaussians=gaussian_cache[target_key],
         frame_indices=target_sequence_indices,
         skin_synth=target_synth,
+        sequence_name="target_sequence_unet",
     )
     return window
 
